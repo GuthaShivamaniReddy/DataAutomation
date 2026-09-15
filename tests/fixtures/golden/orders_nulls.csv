@@ -1,0 +1,5 @@
+order_id,customer_id,order_date,region,net_amount
+4001,C1,2024-04-01,East,10.00
+4002,C2,2024-04-02,West,
+4003,C3,2024-04-03,East,30.00
+4004,,2024-04-04,North,40.00

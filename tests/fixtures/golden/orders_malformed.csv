@@ -1,0 +1,5 @@
+order_id,customer_id,order_date,region,net_amount
+2001,C1,2024-02-01,East,50.00
+2002,C2,2024-02-02,West,60.00,EXTRA
+2003,C3,2024-02-03,East
+2004,C4,2024-02-04,North,80.00

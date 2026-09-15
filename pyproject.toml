@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dataos"
+version = "0.1.0"
+description = "Reliability-first AI-powered data automation platform - deterministic core"
+requires-python = ">=3.11"
+dependencies = [
+    "polars>=1.44",
+    "pyarrow>=25.0",
+    "duckdb>=1.5",
+    "pydantic>=2.13",
+    "openpyxl>=3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.1",
+]
+llm = [
+    "anthropic>=0.40",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,53 @@
+{
+  "metrics": {
+    "recognized_revenue": {
+      "semantic_id": "recognized_revenue",
+      "name": "recognized_revenue",
+      "aliases": ["revenue", "recognized revenue"],
+      "formula": "sum(orders.net_amount) - sum(refunds.amount)",
+      "grain": "order",
+      "filters": ["order_status = completed"],
+      "source_fields": ["orders.net_amount", "refunds.amount"],
+      "currency": "USD",
+      "owner": "finance",
+      "version": 1
+    },
+    "gross_revenue": {
+      "semantic_id": "gross_revenue",
+      "name": "gross_revenue",
+      "aliases": ["revenue", "gross revenue"],
+      "formula": "sum(orders.gross_amount)",
+      "grain": "order",
+      "filters": [],
+      "source_fields": ["orders.gross_amount"],
+      "currency": "USD",
+      "owner": "sales",
+      "version": 1
+    },
+    "order_count": {
+      "semantic_id": "order_count",
+      "name": "order_count",
+      "aliases": ["orders", "number of orders"],
+      "formula": "count(orders.order_id)",
+      "grain": "order",
+      "filters": [],
+      "source_fields": ["orders.order_id"],
+      "owner": "sales",
+      "version": 1
+    }
+  },
+  "dimensions": {
+    "region": {
+      "semantic_id": "region",
+      "name": "region",
+      "aliases": ["territory"],
+      "source_field": "orders.region"
+    }
+  },
+  "entities": {},
+  "calendar": {
+    "timezone": "America/New_York",
+    "week_start": "Monday",
+    "fiscal_year_start_month": 1
+  }
+}
