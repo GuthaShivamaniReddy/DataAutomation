@@ -14,6 +14,7 @@ from dataos.ingestion.snapshot import ingest_file
 from dataos.llm.deterministic import DeterministicLLMClient
 from dataos.registry.operations.aggregate import AggregateOperation
 from dataos.registry.operations.deduplicate import DeduplicateOperation
+from dataos.registry.operations.export import ExportOperation
 from dataos.registry.operations.select_filter import SelectFilterOperation
 from dataos.registry.registry import OperationRegistry
 from dataos.workflow.artifact_store import ArtifactStore
@@ -227,21 +228,22 @@ def test_start_run_from_contract_plans_and_starts_a_run(fixtures_dir, tmp_path):
         status=RequirementStatus.APPROVED,
     )
 
-    run_id, planner_output = orchestrator.start_run_from_contract(
+    planned = orchestrator.start_run_from_contract(
         contract=contract,
         contract_id="rc_orchestrator_test",
         source_frames={"orders": df},
         source_versions={"orders": version},
     )
 
-    assert planner_output.workflow.requirement_contract_id == "rc_orchestrator_test"
-    assert planner_output.envelope.status == "OK"
+    assert planned.planner_output.workflow.requirement_contract_id == "rc_orchestrator_test"
+    assert planned.planner_output.envelope.status == "OK"
+    assert planned.policy_decision.decision == "PROCEED"
 
-    run = orchestrator.run(run_id, planner_output.workflow)
+    run = orchestrator.run(planned.run_id, planned.planner_output.workflow)
     assert run.state == RunState.VERIFYING
 
-    step_id = planner_output.workflow.steps[0].id
-    final_df = artifact_store.load_by_ids(run_id, step_id)
+    step_id = planned.planner_output.workflow.steps[0].id
+    final_df = artifact_store.load_by_ids(planned.run_id, step_id)
     result = dict(zip(final_df["region"].to_list(), final_df["total_net_amount"].to_list()))
     assert result == {"East": 250.75, "West": 200.00, "North": 75.00, "South": 300.10}
 
@@ -272,3 +274,72 @@ def test_start_run_from_contract_without_planner_raises(tmp_path):
         )
 
     assert excinfo.value.code == ErrorCode.NO_SAFE_OPERATION
+
+
+def _export_workflow(dest_path: str) -> Workflow:
+    return Workflow(
+        workflow_version=1,
+        requirement_contract_id="rc_export_test",
+        sources=["orders"],
+        steps=[
+            WorkflowStep(
+                id="s1",
+                operation_id="export",
+                operation_version="1.0",
+                inputs=["source:orders"],
+                params={"format": "csv", "destination_path": dest_path},
+            )
+        ],
+    )
+
+
+def test_start_run_blocks_export_step_without_approval(fixtures_dir, tmp_path):
+    # Policy/Approval Gate: `export` writes to an external destination path
+    # (Constitution rule 7 / Section 29), so it always needs an explicit
+    # approval token - even when the caller builds the Workflow directly
+    # and skips start_run_from_contract entirely.
+    df = pl.read_csv(fixtures_dir / "orders_basic.csv")
+    version = ingest_file(fixtures_dir / "orders_basic.csv", storage_root=tmp_path / "dataos_store")
+
+    registry = OperationRegistry()
+    registry.register(ExportOperation())
+
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    dest = tmp_path / "out.csv"
+    workflow = _export_workflow(str(dest))
+
+    with pytest.raises(PlatformError) as excinfo:
+        orchestrator.start_run(workflow, source_frames={"orders": df}, source_versions={"orders": version})
+
+    assert excinfo.value.code == ErrorCode.POLICY_DENIED
+    assert excinfo.value.evidence["required_approvals"] == ["export"]
+    assert not dest.exists()  # blocked before the run - and its export step - ever ran
+
+
+def test_start_run_with_export_step_proceeds_when_approved(fixtures_dir, tmp_path):
+    df = pl.read_csv(fixtures_dir / "orders_basic.csv")
+    version = ingest_file(fixtures_dir / "orders_basic.csv", storage_root=tmp_path / "dataos_store")
+
+    registry = OperationRegistry()
+    registry.register(ExportOperation())
+
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    dest = tmp_path / "out.csv"
+    workflow = _export_workflow(str(dest))
+
+    run_id = orchestrator.start_run(
+        workflow,
+        source_frames={"orders": df},
+        source_versions={"orders": version},
+        granted_approvals=frozenset({"export"}),
+    )
+    run = orchestrator.run(run_id, workflow)
+
+    assert run.state == RunState.VERIFYING
+    assert dest.exists()

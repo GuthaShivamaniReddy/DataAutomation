@@ -18,7 +18,9 @@ from __future__ import annotations
 import uuid
 
 import polars as pl
+from pydantic import BaseModel
 
+from dataos.compiler.policy_gate import PolicyDecision, PolicyGate
 from dataos.compiler.workflow_planner import PlannerOutput, WorkflowPlanner
 from dataos.contracts.requirement_contract import RequirementContract
 from dataos.errors import ErrorCode, PlatformError
@@ -43,6 +45,16 @@ _TERMINAL_OR_WAITING_STATES = frozenset(
 )
 
 
+class PlannedRun(BaseModel):
+    """Result of `start_run_from_contract`: the created run plus the
+    evidence (Planner envelope, Policy Gate decision) that got it there -
+    Prompt Library Section 38 "Persist every agent input/output for audit"."""
+
+    run_id: str
+    planner_output: PlannerOutput
+    policy_decision: PolicyDecision
+
+
 class WorkflowOrchestrator:
     def __init__(
         self,
@@ -50,11 +62,13 @@ class WorkflowOrchestrator:
         run_store: RunStore,
         artifact_store: ArtifactStore,
         planner: WorkflowPlanner | None = None,
+        policy_gate: PolicyGate | None = None,
     ) -> None:
         self._registry = registry
         self._run_store = run_store
         self._artifact_store = artifact_store
         self._planner = planner
+        self._policy_gate = policy_gate or PolicyGate()
 
     def start_run(
         self,
@@ -62,11 +76,22 @@ class WorkflowOrchestrator:
         *,
         source_frames: dict[str, pl.DataFrame],
         source_versions: dict[str, DatasetVersion],
+        contract: RequirementContract | None = None,
+        granted_approvals: frozenset[str] = frozenset(),
     ) -> str:
         """Validate the DAG, create the run, lock source snapshot ids, and
         seed each declared source as an already-COMPLETED pseudo-step so a
         later `run()` (including after a real crash) never needs the
         original in-memory frames again - only the run_id.
+
+        `contract` is optional context for the Policy/Approval Gate below -
+        a caller with only a typed `Workflow` still gets the
+        operation-risk and `workflow.approval_gates` checks (see
+        `PolicyGate.evaluate`). This is the one place every run must pass
+        through regardless of entry point (`start_run` directly, or
+        `start_run_from_contract`), so it is the only place the gate is
+        enforced - a hand-built `Workflow` with an ungated `export` step
+        cannot skip it by bypassing `start_run_from_contract`.
         """
         workflow.validate_dag()
 
@@ -77,6 +102,20 @@ class WorkflowOrchestrator:
                 ErrorCode.SCHEMA_MISSING,
                 "start_run requires a frame and a DatasetVersion for every declared source",
                 evidence={"missing_frames": missing_frames, "missing_versions": missing_versions},
+            )
+
+        policy_decision = self._policy_gate.evaluate(
+            workflow=workflow, contract=contract, granted_approvals=granted_approvals
+        )
+        if policy_decision.decision == "BLOCKED":
+            raise PlatformError(
+                ErrorCode.POLICY_DENIED,
+                "workflow blocked by the policy/approval gate",
+                evidence={
+                    "risk_level": policy_decision.risk_level,
+                    "required_approvals": policy_decision.required_approvals,
+                    "blocking_reasons": policy_decision.blocking_reasons,
+                },
             )
 
         run_id = str(uuid.uuid4())
@@ -93,10 +132,9 @@ class WorkflowOrchestrator:
                 updated_at=now_iso(),
             )
         )
-        # Blueprint 9.2: DRAFT -> APPROVED requires "contract complete + policy
-        # pass". A real Policy/Approval Gate arrives in a later phase; until
-        # then this transition is a documented no-op placeholder, not a
-        # bypass - the run genuinely cannot proceed without passing through it.
+        # Blueprint 9.2: DRAFT -> APPROVED requires "contract complete +
+        # policy pass" - the policy_gate check above is exactly that pass;
+        # a BLOCKED decision raises before a run is ever created.
         self._run_store.update_run_state(run_id, RunState.APPROVED)
         # Blueprint 9.2: APPROVED -> RUNNING requires "worker allocated +
         # source snapshot locked" - source_snapshot_ids above is exactly that lock.
@@ -128,19 +166,23 @@ class WorkflowOrchestrator:
         source_frames: dict[str, pl.DataFrame],
         source_versions: dict[str, DatasetVersion],
         workflow_version: int = 1,
-    ) -> tuple[str, PlannerOutput]:
+        granted_approvals: frozenset[str] = frozenset(),
+    ) -> PlannedRun:
         """Compose the Workflow Planner (AI Prompt Library Section 9) with
-        `start_run`: Prompt Library "Agent pipeline" ordering is
-        "... -> Semantic Resolver -> Planner -> Policy / Approval Gate ->
-        Deterministic Executor -> ...", so planning happens here, before a
-        run is created, never inside `run()` itself.
+        the Policy/Approval Gate and `start_run`: Prompt Library "Agent
+        pipeline" ordering is "... -> Semantic Resolver -> Planner ->
+        Policy / Approval Gate -> Deterministic Executor -> ...".
+
+        Evaluating the gate here (with the full `RequirementContract`, so
+        `required_approvals`/`side_effects`/`prohibited_actions` are all in
+        scope) lets a blocked plan fail fast with contract-aware evidence
+        before a run row is ever created; `start_run` itself evaluates the
+        same gate again (workflow-only, since it has no contract) as the
+        one enforcement point no caller can bypass - see its docstring.
 
         Callers that already hold a typed `Workflow` (every existing
         caller/test) keep using `start_run` directly - this only exists for
-        callers starting from an approved `RequirementContract`. Returns
-        the `PlannerOutput` alongside `run_id` because - like `start_run` -
-        this orchestrator does not persist the `Workflow` object itself;
-        the caller must hold onto it to later call `run(run_id, workflow)`.
+        callers starting from an approved `RequirementContract`.
         """
         if self._planner is None:
             raise PlatformError(
@@ -154,13 +196,29 @@ class WorkflowOrchestrator:
             workflow_version=workflow_version,
         )
 
+        policy_decision = self._policy_gate.evaluate(
+            workflow=planner_output.workflow, contract=contract, granted_approvals=granted_approvals
+        )
+        if policy_decision.decision == "BLOCKED":
+            raise PlatformError(
+                ErrorCode.POLICY_DENIED,
+                "planned workflow blocked by the policy/approval gate",
+                evidence={
+                    "risk_level": policy_decision.risk_level,
+                    "required_approvals": policy_decision.required_approvals,
+                    "blocking_reasons": policy_decision.blocking_reasons,
+                },
+            )
+
         run_id = self.start_run(
             planner_output.workflow,
             source_frames=source_frames,
             source_versions=source_versions,
+            contract=contract,
+            granted_approvals=granted_approvals,
         )
 
-        return run_id, planner_output
+        return PlannedRun(run_id=run_id, planner_output=planner_output, policy_decision=policy_decision)
 
     def run(self, run_id: str, workflow: Workflow) -> RunRecord:
         run = self._run_store.get_run(run_id)
