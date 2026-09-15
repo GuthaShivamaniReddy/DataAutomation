@@ -16,6 +16,11 @@ Deterministic code, not an LLM call, for the same reason as every other
 gate in this package: finality is a policy decision, never a model's
 confidence (Global Constitution "Finality Rule": "You may label a result
 FINAL only when the release policy explicitly permits you to do so").
+
+When constructed with an `LLMClient`, `decide()` additionally asks it to
+narrate the already-made decision into `ReleaseDecision.narrative` - never
+to decide `decision`, `reason_codes`, or `required_remediation`, all of
+which are already fixed by the time the model is ever called.
 """
 
 from __future__ import annotations
@@ -25,8 +30,11 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from dataos.compiler.independent_verifier import VerifierResult
+from dataos.compiler.narrative import narrate
+from dataos.compiler.prompts import RELEASE_GATE_SYSTEM_PROMPT
 from dataos.compiler.reconciliation_agent import ReconciliationReport
 from dataos.contracts.requirement_contract import RequirementContract, RequirementStatus
+from dataos.llm.client import LLMClient
 from dataos.validation.engine import ValidationReport
 from dataos.workflow.state_machine import RunState
 from dataos.workflow.store import RunRecord
@@ -36,9 +44,15 @@ class ReleaseDecision(BaseModel):
     decision: Literal["RELEASE", "QUARANTINE"]
     reason_codes: list[str] = Field(default_factory=list)
     required_remediation: list[str] = Field(default_factory=list)
+    narrative: str | None = None
+    """Optional human-readable elaboration from an LLM (see class
+    docstring) - never authoritative; `decision` remains the decision."""
 
 
 class ReleaseGate:
+    def __init__(self, llm_client: LLMClient | None = None) -> None:
+        self._llm_client = llm_client
+
     def decide(
         self,
         *,
@@ -83,8 +97,27 @@ class ReleaseGate:
         else:
             required_remediation = []
 
+        narrative = None
+        if self._llm_client is not None:
+            narratives = narrate(
+                self._llm_client,
+                system_prompt=RELEASE_GATE_SYSTEM_PROMPT,
+                items=[
+                    {
+                        "ref": "summary",
+                        "facts": {
+                            "decision": decision,
+                            "reason_codes": reason_codes,
+                            "required_remediation": required_remediation,
+                        },
+                    }
+                ],
+            )
+            narrative = narratives.get("summary")
+
         return ReleaseDecision(
             decision=decision,
             reason_codes=reason_codes,
             required_remediation=required_remediation,
+            narrative=narrative,
         )

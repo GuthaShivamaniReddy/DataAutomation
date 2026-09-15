@@ -26,6 +26,11 @@ Deliberately "dumb" for every response model it supports:
     prechecks/postchecks empty - it never adds real narrative detail,
     relying entirely on `ConnectorWritePlanner`'s own hardcoded safety
     floor for anything that actually matters.
+  - `RawNarrative`: echoes each item it was asked to narrate back with a
+    templated one-line sentence - the shared optional narrative layer on
+    `ValidationRuleGenerator`, `ReconciliationAgent`, `IndependentVerifier`,
+    `ConfidenceScorer`, `ReleaseGate`, and `SchemaDriftMonitor` never
+    changes any of those components' actual decisions regardless.
 Using genuinely naive rules here keeps the tests honest: they exercise the
 pipeline's safety logic (registry validation, DAG validation, ambiguity
 blocking, evidence-ref validation), not a hand-tuned fake AI.
@@ -40,6 +45,7 @@ import uuid
 from dataos.compiler.extraction import ExtractedMetric, RawExtraction
 from dataos.compiler.raw_connector_plan import RawConnectorPlan, RawExternalAction
 from dataos.compiler.raw_explanation import Finding, RawExplanation
+from dataos.compiler.raw_narrative import RawNarrative, RawNarrativeItem
 from dataos.compiler.raw_plan import RawPlan, RawPlanStep
 from dataos.errors import ErrorCode, PlatformError
 from dataos.llm.client import LLMClient, T
@@ -66,7 +72,7 @@ _TIMEZONE_HINT = re.compile(r"\b(UTC|GMT|[A-Za-z_]+/[A-Za-z_]+)\b")
 # the same "leave it to a real model" boundary the extraction side draws.
 _SIMPLE_METRIC_FORMULA = re.compile(r"^(sum|count|mean|min|max|n_unique)\(\w+\.(\w+)\)$")
 
-_SUPPORTED_RESPONSE_MODELS = (RawExtraction, RawPlan, RawExplanation, RawConnectorPlan)
+_SUPPORTED_RESPONSE_MODELS = (RawExtraction, RawPlan, RawExplanation, RawConnectorPlan, RawNarrative)
 
 
 class DeterministicLLMClient(LLMClient):
@@ -79,6 +85,8 @@ class DeterministicLLMClient(LLMClient):
             return self._explain(user_prompt)  # type: ignore[return-value]
         if response_model is RawConnectorPlan:
             return self._plan_connector_actions(user_prompt)  # type: ignore[return-value]
+        if response_model is RawNarrative:
+            return self._narrate(user_prompt)  # type: ignore[return-value]
         raise PlatformError(
             ErrorCode.MODEL_OUTPUT_INVALID,
             (
@@ -197,3 +205,19 @@ class DeterministicLLMClient(LLMClient):
             for step in context.get("steps", [])
         ]
         return RawConnectorPlan(actions=actions)
+
+    def _narrate(self, context_json: str) -> RawNarrative:
+        """`context_json` is `{"items": [{"ref": "...", "facts": {...}}]}` -
+        one entry per already-computed fact bundle a caller wants narrated.
+        This double writes one templated sentence per item; it adds no
+        interpretation of its own, since none of the six callers of this
+        response model ever trust the narrative for anything but prose."""
+        context = json.loads(context_json)
+        items = [
+            RawNarrativeItem(
+                ref=item["ref"],
+                narrative=f"Automated summary for '{item['ref']}': {json.dumps(item.get('facts', {}), sort_keys=True)}",
+            )
+            for item in context.get("items", [])
+        ]
+        return RawNarrative(items=items)

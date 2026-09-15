@@ -179,3 +179,20 @@ def test_prohibited_operation_used_is_a_defect():
 
     assert result.verdict == "FAIL"
     assert any("prohibited operation" in d for d in result.defects)
+
+
+def test_narrative_is_none_without_an_llm_client():
+    result = IndependentVerifier().verify(
+        contract=_contract(), workflow=_workflow(), run=_run(), step_runs=[_completed_step()]
+    )
+    assert result.narrative is None
+
+
+def test_narrative_is_populated_without_changing_the_verdict_when_llm_client_supplied():
+    from dataos.llm.deterministic import DeterministicLLMClient
+
+    verifier = IndependentVerifier(DeterministicLLMClient())
+    result = verifier.verify(contract=_contract(), workflow=_workflow(), run=_run(), step_runs=[_completed_step()])
+
+    assert result.narrative is not None
+    assert result.verdict == "PASS"  # the narrative never changes the decision

@@ -16,6 +16,13 @@ model's account of what happened. Every check re-derives its answer from
 the `StepRunRecord`s the orchestrator itself already wrote, and from the
 `RequirementContract`/`Workflow` the earlier gates already validated -
 never from a fresh model call that could hallucinate success.
+
+When constructed with an `LLMClient`, `verify()` additionally asks it to
+narrate the already-computed `VerifierResult` into
+`VerifierResult.narrative` - never to decide `verdict`,
+`requirement_coverage`, `defects`, `unverified_claims`, or
+`release_recommendation`, all of which are already fixed by the time the
+model is ever called.
 """
 
 from __future__ import annotations
@@ -24,7 +31,10 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from dataos.compiler.narrative import narrate
+from dataos.compiler.prompts import INDEPENDENT_VERIFIER_SYSTEM_PROMPT
 from dataos.contracts.requirement_contract import RequirementContract
+from dataos.llm.client import LLMClient
 from dataos.workflow.dsl import Workflow
 from dataos.workflow.store import RunRecord, StepRunRecord
 
@@ -43,9 +53,15 @@ class VerifierResult(BaseModel):
     defects: list[str] = Field(default_factory=list)
     unverified_claims: list[str] = Field(default_factory=list)
     release_recommendation: Literal["RELEASE", "QUARANTINE"]
+    narrative: str | None = None
+    """Optional human-readable elaboration from an LLM (see class
+    docstring) - never authoritative; `verdict` remains the decision."""
 
 
 class IndependentVerifier:
+    def __init__(self, llm_client: LLMClient | None = None) -> None:
+        self._llm_client = llm_client
+
     def verify(
         self,
         *,
@@ -145,12 +161,33 @@ class IndependentVerifier:
             verdict = "PASS"
             release_recommendation = "RELEASE"
 
+        narrative = None
+        if self._llm_client is not None:
+            narratives = narrate(
+                self._llm_client,
+                system_prompt=INDEPENDENT_VERIFIER_SYSTEM_PROMPT,
+                items=[
+                    {
+                        "ref": "summary",
+                        "facts": {
+                            "verdict": verdict,
+                            "requirement_coverage": [c.model_dump() for c in requirement_coverage],
+                            "defects": defects,
+                            "unverified_claims": unverified_claims,
+                            "release_recommendation": release_recommendation,
+                        },
+                    }
+                ],
+            )
+            narrative = narratives.get("summary")
+
         return VerifierResult(
             verdict=verdict,
             requirement_coverage=requirement_coverage,
             defects=defects,
             unverified_claims=unverified_claims,
             release_recommendation=release_recommendation,
+            narrative=narrative,
         )
 
 

@@ -24,6 +24,11 @@ codebase already computes elsewhere (`RequirementContract`,
 "model/prediction uncertainty (if applicable)" as a dimension; no
 forecast/ML operation exists in this codebase yet, so it is omitted
 rather than scored with an invented placeholder.
+
+When constructed with an `LLMClient`, `score()` additionally asks it to
+narrate the already-computed scores into `ConfidenceReport.narrative` -
+never to decide any score or `overall_status`, both of which are already
+fixed by the time the model is ever called.
 """
 
 from __future__ import annotations
@@ -33,9 +38,12 @@ from typing import Literal
 from pydantic import BaseModel
 
 from dataos.compiler.independent_verifier import VerifierResult
+from dataos.compiler.narrative import narrate
+from dataos.compiler.prompts import CONFIDENCE_SCORER_SYSTEM_PROMPT
 from dataos.compiler.reconciliation_agent import ReconciliationReport
 from dataos.compiler.release_gate import ReleaseDecision
 from dataos.contracts.requirement_contract import DefinitionStatus, RequirementContract
+from dataos.llm.client import LLMClient
 from dataos.validation.engine import ValidationReport
 from dataos.workflow.dsl import Workflow
 from dataos.workflow.store import RunRecord, StepRunRecord
@@ -70,9 +78,16 @@ class ConfidenceReport(BaseModel):
     scores: ConfidenceScores
     critical_failures: list[str]
     evidence_refs: list[str]
+    narrative: str | None = None
+    """Optional human-readable elaboration from an LLM (see class
+    docstring) - never authoritative; `overall_status` remains the
+    decision."""
 
 
 class ConfidenceScorer:
+    def __init__(self, llm_client: LLMClient | None = None) -> None:
+        self._llm_client = llm_client
+
     def score(
         self,
         *,
@@ -100,12 +115,32 @@ class ConfidenceScorer:
         )
 
         evidence_refs = [f"run:{run.run_id}"] + [f"step:{s.id}" for s in workflow.steps]
+        critical_failures = list(release_decision.reason_codes)
+
+        narrative = None
+        if self._llm_client is not None:
+            narratives = narrate(
+                self._llm_client,
+                system_prompt=CONFIDENCE_SCORER_SYSTEM_PROMPT,
+                items=[
+                    {
+                        "ref": "summary",
+                        "facts": {
+                            "overall_status": overall_status,
+                            "scores": scores.model_dump(),
+                            "critical_failures": critical_failures,
+                        },
+                    }
+                ],
+            )
+            narrative = narratives.get("summary")
 
         return ConfidenceReport(
             overall_status=overall_status,
             scores=scores,
-            critical_failures=list(release_decision.reason_codes),
+            critical_failures=critical_failures,
             evidence_refs=evidence_refs,
+            narrative=narrative,
         )
 
     def _requirements_score(self, contract: RequirementContract) -> float:

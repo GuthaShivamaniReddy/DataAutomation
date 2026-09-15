@@ -252,3 +252,37 @@ def test_verifier_defects_zero_the_verification_score():
     )
 
     assert report.scores.verification == 0.0
+
+
+def test_narrative_is_none_without_an_llm_client():
+    scorer = ConfidenceScorer()
+    report = scorer.score(
+        contract=_contract(),
+        run=_run(),
+        workflow=_workflow(),
+        step_runs=_completed_step_runs(),
+        validation_report=ValidationReport(results=[]),
+        reconciliation_report=ReconciliationReport(status="PASS", tests=[], blocking_reasons=[]),
+        verifier_result=_clean_verifier_result(),
+        release_decision=ReleaseDecision(decision="RELEASE", reason_codes=[], required_remediation=[]),
+    )
+    assert report.narrative is None
+
+
+def test_narrative_is_populated_without_changing_overall_status_when_llm_client_supplied():
+    from dataos.llm.deterministic import DeterministicLLMClient
+
+    scorer = ConfidenceScorer(DeterministicLLMClient())
+    report = scorer.score(
+        contract=_contract(),
+        run=_run(),
+        workflow=_workflow(),
+        step_runs=_completed_step_runs(),
+        validation_report=ValidationReport(results=[]),
+        reconciliation_report=ReconciliationReport(status="PASS", tests=[], blocking_reasons=[]),
+        verifier_result=_clean_verifier_result(),
+        release_decision=ReleaseDecision(decision="RELEASE", reason_codes=[], required_remediation=[]),
+    )
+
+    assert report.narrative is not None
+    assert report.overall_status == "RELEASABLE"  # the narrative never changes the decision

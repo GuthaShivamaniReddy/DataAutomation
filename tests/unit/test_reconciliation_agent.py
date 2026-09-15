@@ -138,3 +138,18 @@ def test_non_sum_metric_and_unrelated_steps_produce_no_tests():
     assert report.tests == []
     assert report.blocking_reasons == []
     assert report.status == "PASS"
+
+
+def test_narrative_is_none_without_an_llm_client():
+    report = ReconciliationAgent().reconcile(contract=_contract(), workflow=_workflow([]), artifacts={})
+    assert report.narrative is None
+
+
+def test_narrative_is_populated_without_changing_the_status_when_llm_client_supplied():
+    from dataos.llm.deterministic import DeterministicLLMClient
+
+    agent = ReconciliationAgent(DeterministicLLMClient())
+    report = agent.reconcile(contract=_contract(), workflow=_workflow([]), artifacts={})
+
+    assert report.narrative is not None
+    assert report.status == "PASS"  # the narrative never changes the decision

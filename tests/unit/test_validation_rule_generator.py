@@ -156,3 +156,23 @@ def test_acceptance_tests_generate_one_check_each():
     assert rules[0].predicate == "row_count > 0"
     assert rules[0].requirement_ref == "row_count > 0"
     assert rules[0].check_function is None
+
+
+def test_narrative_is_none_without_an_llm_client():
+    contract = _contract(null_policy={"net_amount": "error"})
+    rules = ValidationRuleGenerator().generate(contract=contract, workflow=_workflow([]))
+    assert rules[0].narrative is None
+
+
+def test_narrative_is_populated_without_changing_the_check_when_llm_client_supplied():
+    from dataos.llm.deterministic import DeterministicLLMClient
+
+    contract = _contract(null_policy={"net_amount": "error"})
+    generator = ValidationRuleGenerator(DeterministicLLMClient())
+    rules = generator.generate(contract=contract, workflow=_workflow([]))
+
+    assert rules[0].narrative is not None
+    # The narrative never changes what the check actually does.
+    assert rules[0].check_function == "check_null_rate"
+    assert rules[0].check_args == {"column": "net_amount", "max_rate": 0.0}
+    assert rules[0].severity == "BLOCKING"

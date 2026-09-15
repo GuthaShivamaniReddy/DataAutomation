@@ -23,6 +23,12 @@ no separate source-version identifier distinct from the profile itself,
 so this monitor produces nothing for either rather than inventing a
 signal that was never computed (the same "no field, no check" discipline
 `ValidationRuleGenerator` and `ReconciliationAgent` already follow).
+
+When constructed with an `LLMClient`, `compare()` additionally asks it to
+narrate the already-computed `DriftReport` into `DriftReport.narrative` -
+never to decide a change's `classification`, `drift_status`, or
+`automation_action`, all of which are already fixed by the time the model
+is ever called.
 """
 
 from __future__ import annotations
@@ -31,7 +37,10 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from dataos.compiler.narrative import narrate
+from dataos.compiler.prompts import SCHEMA_DRIFT_MONITOR_SYSTEM_PROMPT
 from dataos.ingestion.profiling import ColumnProfile, DatasetProfile
+from dataos.llm.client import LLMClient
 from dataos.semantics.dictionary import SemanticDictionary
 
 Classification = Literal["COMPATIBLE", "REVIEW_REQUIRED", "BREAKING"]
@@ -60,12 +69,23 @@ class DriftReport(BaseModel):
     drift_status: DriftStatus
     changes: list[DriftChange] = Field(default_factory=list)
     automation_action: AutomationAction
+    narrative: str | None = None
+    """Optional human-readable elaboration from an LLM (see class
+    docstring) - never authoritative; `drift_status` remains the
+    decision."""
 
 
 class SchemaDriftMonitor:
-    def __init__(self, *, null_rate_review_threshold: float = 0.05, row_count_review_ratio: float = 0.5) -> None:
+    def __init__(
+        self,
+        *,
+        null_rate_review_threshold: float = 0.05,
+        row_count_review_ratio: float = 0.5,
+        llm_client: LLMClient | None = None,
+    ) -> None:
         self._null_rate_review_threshold = null_rate_review_threshold
         self._row_count_review_ratio = row_count_review_ratio
+        self._llm_client = llm_client
 
     def compare(
         self,
@@ -124,11 +144,33 @@ class SchemaDriftMonitor:
             changes.extend(self._semantic_changes(baseline_dictionary, current_dictionary))
 
         status = _aggregate_status(changes)
+        automation_action = _AUTOMATION_ACTION[status]
+
+        narrative = None
+        if self._llm_client is not None:
+            narratives = narrate(
+                self._llm_client,
+                system_prompt=SCHEMA_DRIFT_MONITOR_SYSTEM_PROMPT,
+                items=[
+                    {
+                        "ref": "summary",
+                        "facts": {
+                            "source_name": source_name,
+                            "drift_status": status,
+                            "automation_action": automation_action,
+                            "changes": [c.model_dump() for c in changes],
+                        },
+                    }
+                ],
+            )
+            narrative = narratives.get("summary")
+
         return DriftReport(
             source_name=source_name,
             drift_status=status,
             changes=changes,
-            automation_action=_AUTOMATION_ACTION[status],
+            automation_action=automation_action,
+            narrative=narrative,
         )
 
     def _column_changes(self, name: str, baseline: ColumnProfile, current: ColumnProfile) -> list[DriftChange]:

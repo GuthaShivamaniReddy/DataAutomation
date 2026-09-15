@@ -209,3 +209,22 @@ def test_calendar_policy_change_is_review_required():
 
     assert report.drift_status == "REVIEW_REQUIRED"
     assert any(c.kind == "calendar_policy_changed" for c in report.changes)
+
+
+def test_narrative_is_none_without_an_llm_client():
+    df = pl.DataFrame({"order_id": [1]})
+    report = SchemaDriftMonitor().compare(
+        source_name="orders", baseline_profile=_profile(df), current_profile=_profile(df.clone())
+    )
+    assert report.narrative is None
+
+
+def test_narrative_is_populated_without_changing_drift_status_when_llm_client_supplied():
+    from dataos.llm.deterministic import DeterministicLLMClient
+
+    df = pl.DataFrame({"order_id": [1]})
+    monitor = SchemaDriftMonitor(llm_client=DeterministicLLMClient())
+    report = monitor.compare(source_name="orders", baseline_profile=_profile(df), current_profile=_profile(df.clone()))
+
+    assert report.narrative is not None
+    assert report.drift_status == "NONE"  # the narrative never changes the decision

@@ -26,6 +26,14 @@ primitive" discipline `WorkflowPlanner` applies to operation ids.
 enforces structurally at execution time (e.g. join-key uniqueness), where
 this generator's job is to surface that guarantee in the manifest, not to
 re-implement it as a second, possibly-divergent check.
+
+When constructed with an `LLMClient`, `generate()` additionally asks it to
+narrate each already-built `CheckSpec` into `CheckSpec.narrative` - never
+to decide `check_function`, `check_args`, `tolerance`, `severity`, or
+`on_fail`, all of which are already fixed by the time the model is ever
+called. Narration is best-effort: a `CheckSpec` the model did not answer
+for simply keeps `narrative=None`, exactly as if no `llm_client` had been
+supplied.
 """
 
 from __future__ import annotations
@@ -35,7 +43,10 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 import dataos.validation.checks as checks
+from dataos.compiler.narrative import narrate
+from dataos.compiler.prompts import VALIDATION_RULE_GENERATOR_SYSTEM_PROMPT
 from dataos.contracts.requirement_contract import RequirementContract
+from dataos.llm.client import LLMClient
 from dataos.workflow.dsl import Workflow, WorkflowStep
 
 _DEFAULT_RECONCILIATION_TOLERANCE = 0.01
@@ -63,9 +74,16 @@ class CheckSpec(BaseModel):
     severity: Severity = "BLOCKING"
     on_fail: OnFail = "STOP"
     requirement_ref: str | None = None
+    narrative: str | None = None
+    """Optional human-readable elaboration from an LLM (see class
+    docstring) - never authoritative; `predicate` remains the exact
+    assertion."""
 
 
 class ValidationRuleGenerator:
+    def __init__(self, llm_client: LLMClient | None = None) -> None:
+        self._llm_client = llm_client
+
     def generate(self, *, contract: RequirementContract, workflow: Workflow) -> list[CheckSpec]:
         rules: list[CheckSpec] = []
         rules.extend(self._null_policy_checks(contract))
@@ -82,6 +100,21 @@ class ValidationRuleGenerator:
                 f"ValidationRuleGenerator produced check_function name(s) not present in "
                 f"dataos.validation.checks: {unknown_functions}"
             )
+
+        if self._llm_client is not None and rules:
+            narratives = narrate(
+                self._llm_client,
+                system_prompt=VALIDATION_RULE_GENERATOR_SYSTEM_PROMPT,
+                items=[
+                    {"ref": r.check_id, "facts": {"predicate": r.predicate, "severity": r.severity, "stage": r.stage}}
+                    for r in rules
+                ],
+            )
+            rules = [
+                r.model_copy(update={"narrative": narratives[r.check_id]}) if r.check_id in narratives else r
+                for r in rules
+            ]
+
         return rules
 
     def _null_policy_checks(self, contract: RequirementContract) -> list[CheckSpec]:

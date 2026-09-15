@@ -1,8 +1,12 @@
 import polars as pl
 import pytest
 
+from dataos.compiler.confidence_scorer import ConfidenceScorer
 from dataos.compiler.connector_planner import ConnectorWritePlanner
 from dataos.compiler.explanation_agent import ExplanationAgent
+from dataos.compiler.independent_verifier import IndependentVerifier
+from dataos.compiler.reconciliation_agent import ReconciliationAgent
+from dataos.compiler.release_gate import ReleaseGate
 from dataos.compiler.workflow_planner import WorkflowPlanner
 from dataos.contracts.requirement_contract import (
     DefinitionStatus,
@@ -446,6 +450,60 @@ def test_release_after_full_pipeline_reaches_released(fixtures_dir, tmp_path):
     # transition attempt (which state_machine.transition would reject).
     again = orchestrator.release(planned.run_id, planned.planner_output.workflow, contract)
     assert again.run.state == RunState.RELEASED
+
+
+def test_release_narratives_populate_when_gates_are_llm_backed_without_changing_decisions(fixtures_dir, tmp_path):
+    df = pl.read_csv(fixtures_dir / "orders_basic.csv")
+    version = ingest_file(fixtures_dir / "orders_basic.csv", storage_root=tmp_path / "dataos_store")
+
+    registry = OperationRegistry()
+    registry.register(AggregateOperation())
+
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    planner = WorkflowPlanner(DeterministicLLMClient(), registry)
+    llm = DeterministicLLMClient()
+    orchestrator = WorkflowOrchestrator(
+        registry,
+        run_store,
+        artifact_store,
+        planner,
+        verifier=IndependentVerifier(llm),
+        release_gate=ReleaseGate(llm),
+        reconciliation_agent=ReconciliationAgent(llm),
+        confidence_scorer=ConfidenceScorer(llm),
+    )
+
+    contract = RequirementContract(
+        objective="show order count",
+        sources=[Source(name="orders")],
+        metrics=[
+            Metric(name="order_count", formula="count(orders.order_id)", definition_status=DefinitionStatus.GOVERNED)
+        ],
+        status=RequirementStatus.APPROVED,
+    )
+
+    planned = orchestrator.start_run_from_contract(
+        contract=contract,
+        contract_id="rc_narrative_test",
+        source_frames={"orders": df},
+        source_versions={"orders": version},
+    )
+    orchestrator.run(planned.run_id, planned.planner_output.workflow)
+
+    result = orchestrator.release(planned.run_id, planned.planner_output.workflow, contract)
+
+    # Every gate's actual decision is unchanged from the deterministic-only path.
+    assert result.run.state == RunState.RELEASED
+    assert result.verifier_result.verdict == "PASS"
+    assert result.release_decision.decision == "RELEASE"
+    assert result.confidence_report.overall_status == "RELEASABLE"
+
+    # But each now carries an LLM-authored narrative alongside that decision.
+    assert result.verifier_result.narrative is not None
+    assert result.release_decision.narrative is not None
+    assert result.confidence_report.narrative is not None
+    assert result.reconciliation_report.narrative is not None
 
 
 def test_release_quarantines_when_a_declared_metric_is_never_computed(fixtures_dir, tmp_path):

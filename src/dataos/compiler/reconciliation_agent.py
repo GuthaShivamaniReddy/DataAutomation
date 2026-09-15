@@ -32,6 +32,12 @@ source-vs-target transfer counts) - `RequirementContract` has no field
 for an external control total today, so a `sum` metric with no group_by
 anchor is reported UNAVAILABLE rather than silently skipped, exactly per
 Section 20's own instruction.
+
+When constructed with an `LLMClient`, `reconcile()` additionally asks it
+to narrate the already-computed `ReconciliationReport` into
+`ReconciliationReport.narrative` - never to decide `status`, a test's
+`passed`, or `blocking_reasons`, all of which are already fixed by the
+time the model is ever called.
 """
 
 from __future__ import annotations
@@ -41,7 +47,10 @@ from typing import Literal
 import polars as pl
 from pydantic import BaseModel, Field
 
+from dataos.compiler.narrative import narrate
+from dataos.compiler.prompts import RECONCILIATION_AGENT_SYSTEM_PROMPT
 from dataos.contracts.requirement_contract import RequirementContract
+from dataos.llm.client import LLMClient
 from dataos.validation.checks.conservation import check_row_count_conservation
 from dataos.validation.checks.reconciliation import check_reconciliation
 from dataos.workflow.dsl import Workflow, WorkflowStep
@@ -66,9 +75,15 @@ class ReconciliationReport(BaseModel):
     status: Status
     tests: list[ReconciliationTest] = Field(default_factory=list)
     blocking_reasons: list[str] = Field(default_factory=list)
+    narrative: str | None = None
+    """Optional human-readable elaboration from an LLM (see class
+    docstring) - never authoritative; `status` remains the decision."""
 
 
 class ReconciliationAgent:
+    def __init__(self, llm_client: LLMClient | None = None) -> None:
+        self._llm_client = llm_client
+
     def reconcile(
         self,
         *,
@@ -119,7 +134,25 @@ class ReconciliationAgent:
         else:
             status = "PASS"
 
-        return ReconciliationReport(status=status, tests=tests, blocking_reasons=blocking_reasons)
+        narrative = None
+        if self._llm_client is not None:
+            narratives = narrate(
+                self._llm_client,
+                system_prompt=RECONCILIATION_AGENT_SYSTEM_PROMPT,
+                items=[
+                    {
+                        "ref": "summary",
+                        "facts": {
+                            "status": status,
+                            "tests": [t.model_dump() for t in tests],
+                            "blocking_reasons": blocking_reasons,
+                        },
+                    }
+                ],
+            )
+            narrative = narratives.get("summary")
+
+        return ReconciliationReport(status=status, tests=tests, blocking_reasons=blocking_reasons, narrative=narrative)
 
     def _row_conservation_test(
         self, step: WorkflowStep, artifacts: dict[str, pl.DataFrame]

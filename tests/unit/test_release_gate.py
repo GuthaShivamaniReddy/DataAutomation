@@ -126,3 +126,18 @@ def test_releases_when_reconciliation_passes():
     )
 
     assert decision.decision == "RELEASE"
+
+
+def test_narrative_is_none_without_an_llm_client():
+    decision = ReleaseGate().decide(contract=_approved_contract(), run=_run(), verifier_result=_passing_verifier_result())
+    assert decision.narrative is None
+
+
+def test_narrative_is_populated_without_changing_the_decision_when_llm_client_supplied():
+    from dataos.llm.deterministic import DeterministicLLMClient
+
+    gate = ReleaseGate(DeterministicLLMClient())
+    decision = gate.decide(contract=_approved_contract(), run=_run(), verifier_result=_passing_verifier_result())
+
+    assert decision.narrative is not None
+    assert decision.decision == "RELEASE"  # the narrative never changes the decision
