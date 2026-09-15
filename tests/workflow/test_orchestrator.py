@@ -534,3 +534,34 @@ def test_explain_without_explainer_raises(fixtures_dir, tmp_path):
         orchestrator_without_explainer.explain(planned.run_id, planned.planner_output.workflow, contract)
 
     assert excinfo.value.code == ErrorCode.NO_SAFE_OPERATION
+
+
+def test_generate_validation_checks_for_a_planned_sum_metric_workflow(tmp_path):
+    registry = OperationRegistry()
+    registry.register(AggregateOperation())
+
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    planner = WorkflowPlanner(DeterministicLLMClient(), registry)
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store, planner)
+
+    contract = RequirementContract(
+        objective="show total net amount",
+        sources=[Source(name="orders")],
+        metrics=[
+            Metric(name="total_amount", formula="sum(orders.net_amount)", definition_status=DefinitionStatus.GOVERNED)
+        ],
+        tolerances={"total_amount": 2.5},
+        status=RequirementStatus.APPROVED,
+    )
+
+    planned_workflow = planner.plan(contract=contract, contract_id="rc_checks_test").workflow
+    checks = orchestrator.generate_validation_checks(planned_workflow, contract)
+
+    assert len(checks) == 1
+    check = checks[0]
+    assert check.check_id == "reconciliation:total_amount"
+    assert check.stage == "s1"
+    assert check.check_function == "check_dual_computation"
+    assert check.check_args == {"column": "net_amount", "agg": "sum", "tolerance": 2.5}
+    assert check.tolerance == 2.5

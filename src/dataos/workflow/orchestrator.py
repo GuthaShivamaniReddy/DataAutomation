@@ -24,6 +24,7 @@ from dataos.compiler.explanation_agent import Audience, ExplanationAgent, Explan
 from dataos.compiler.independent_verifier import IndependentVerifier, VerifierResult
 from dataos.compiler.policy_gate import PolicyDecision, PolicyGate
 from dataos.compiler.release_gate import ReleaseDecision, ReleaseGate
+from dataos.compiler.validation_rule_generator import CheckSpec, ValidationRuleGenerator
 from dataos.compiler.workflow_planner import PlannerOutput, WorkflowPlanner
 from dataos.contracts.requirement_contract import RequirementContract
 from dataos.errors import ErrorCode, PlatformError
@@ -83,6 +84,7 @@ class WorkflowOrchestrator:
         verifier: IndependentVerifier | None = None,
         release_gate: ReleaseGate | None = None,
         explainer: ExplanationAgent | None = None,
+        rule_generator: ValidationRuleGenerator | None = None,
     ) -> None:
         self._registry = registry
         self._run_store = run_store
@@ -92,6 +94,15 @@ class WorkflowOrchestrator:
         self._verifier = verifier or IndependentVerifier()
         self._release_gate = release_gate or ReleaseGate()
         self._explainer = explainer
+        self._rule_generator = rule_generator or ValidationRuleGenerator()
+
+    def generate_validation_checks(self, workflow: Workflow, contract: RequirementContract) -> list[CheckSpec]:
+        """Validation Rule Generator (Section 19). Pure and read-only - it
+        produces the check manifest for a planned workflow but does not
+        execute or store anything, so it can be called any time after a
+        `Workflow` exists (typically right after planning, before or
+        alongside `run()`)."""
+        return self._rule_generator.generate(contract=contract, workflow=workflow)
 
     def start_run(
         self,
