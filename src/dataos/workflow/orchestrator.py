@@ -19,6 +19,8 @@ import uuid
 
 import polars as pl
 
+from dataos.compiler.workflow_planner import PlannerOutput, WorkflowPlanner
+from dataos.contracts.requirement_contract import RequirementContract
 from dataos.errors import ErrorCode, PlatformError
 from dataos.ingestion.snapshot import DatasetVersion
 from dataos.registry.base import Operation
@@ -42,10 +44,17 @@ _TERMINAL_OR_WAITING_STATES = frozenset(
 
 
 class WorkflowOrchestrator:
-    def __init__(self, registry: OperationRegistry, run_store: RunStore, artifact_store: ArtifactStore) -> None:
+    def __init__(
+        self,
+        registry: OperationRegistry,
+        run_store: RunStore,
+        artifact_store: ArtifactStore,
+        planner: WorkflowPlanner | None = None,
+    ) -> None:
         self._registry = registry
         self._run_store = run_store
         self._artifact_store = artifact_store
+        self._planner = planner
 
     def start_run(
         self,
@@ -110,6 +119,48 @@ class WorkflowOrchestrator:
             )
 
         return run_id
+
+    def start_run_from_contract(
+        self,
+        *,
+        contract: RequirementContract,
+        contract_id: str,
+        source_frames: dict[str, pl.DataFrame],
+        source_versions: dict[str, DatasetVersion],
+        workflow_version: int = 1,
+    ) -> tuple[str, PlannerOutput]:
+        """Compose the Workflow Planner (AI Prompt Library Section 9) with
+        `start_run`: Prompt Library "Agent pipeline" ordering is
+        "... -> Semantic Resolver -> Planner -> Policy / Approval Gate ->
+        Deterministic Executor -> ...", so planning happens here, before a
+        run is created, never inside `run()` itself.
+
+        Callers that already hold a typed `Workflow` (every existing
+        caller/test) keep using `start_run` directly - this only exists for
+        callers starting from an approved `RequirementContract`. Returns
+        the `PlannerOutput` alongside `run_id` because - like `start_run` -
+        this orchestrator does not persist the `Workflow` object itself;
+        the caller must hold onto it to later call `run(run_id, workflow)`.
+        """
+        if self._planner is None:
+            raise PlatformError(
+                ErrorCode.NO_SAFE_OPERATION,
+                "orchestrator was constructed without a WorkflowPlanner; pass one to plan from a RequirementContract",
+            )
+
+        planner_output = self._planner.plan(
+            contract=contract,
+            contract_id=contract_id,
+            workflow_version=workflow_version,
+        )
+
+        run_id = self.start_run(
+            planner_output.workflow,
+            source_frames=source_frames,
+            source_versions=source_versions,
+        )
+
+        return run_id, planner_output
 
     def run(self, run_id: str, workflow: Workflow) -> RunRecord:
         run = self._run_store.get_run(run_id)

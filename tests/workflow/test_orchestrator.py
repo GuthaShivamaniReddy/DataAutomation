@@ -1,7 +1,17 @@
 import polars as pl
 import pytest
 
+from dataos.compiler.workflow_planner import WorkflowPlanner
+from dataos.contracts.requirement_contract import (
+    DefinitionStatus,
+    Metric,
+    RequirementContract,
+    RequirementStatus,
+    Source,
+)
+from dataos.errors import ErrorCode, PlatformError
 from dataos.ingestion.snapshot import ingest_file
+from dataos.llm.deterministic import DeterministicLLMClient
 from dataos.registry.operations.aggregate import AggregateOperation
 from dataos.registry.operations.deduplicate import DeduplicateOperation
 from dataos.registry.operations.select_filter import SelectFilterOperation
@@ -189,3 +199,76 @@ def test_run_is_a_no_op_once_already_verifying(fixtures_dir, tmp_path):
     again = orchestrator.run(run_id, workflow)
     assert again.state == RunState.VERIFYING
     assert counting_filter.call_count == 1  # calling run() again on a finished run touches nothing
+
+
+def test_start_run_from_contract_plans_and_starts_a_run(fixtures_dir, tmp_path):
+    df = pl.read_csv(fixtures_dir / "orders_basic.csv")
+    version = ingest_file(fixtures_dir / "orders_basic.csv", storage_root=tmp_path / "dataos_store")
+
+    registry = OperationRegistry()
+    registry.register(AggregateOperation())
+
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    planner = WorkflowPlanner(DeterministicLLMClient(), registry)
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store, planner)
+
+    contract = RequirementContract(
+        objective="show total net amount by region",
+        sources=[Source(name="orders")],
+        metrics=[
+            Metric(
+                name="total_net_amount",
+                formula="sum(orders.net_amount)",
+                definition_status=DefinitionStatus.GOVERNED,
+            )
+        ],
+        group_by=["region"],
+        status=RequirementStatus.APPROVED,
+    )
+
+    run_id, planner_output = orchestrator.start_run_from_contract(
+        contract=contract,
+        contract_id="rc_orchestrator_test",
+        source_frames={"orders": df},
+        source_versions={"orders": version},
+    )
+
+    assert planner_output.workflow.requirement_contract_id == "rc_orchestrator_test"
+    assert planner_output.envelope.status == "OK"
+
+    run = orchestrator.run(run_id, planner_output.workflow)
+    assert run.state == RunState.VERIFYING
+
+    step_id = planner_output.workflow.steps[0].id
+    final_df = artifact_store.load_by_ids(run_id, step_id)
+    result = dict(zip(final_df["region"].to_list(), final_df["total_net_amount"].to_list()))
+    assert result == {"East": 250.75, "West": 200.00, "North": 75.00, "South": 300.10}
+
+
+def test_start_run_from_contract_without_planner_raises(tmp_path):
+    registry = OperationRegistry()
+    registry.register(AggregateOperation())
+
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)  # no planner
+
+    contract = RequirementContract(
+        objective="show total net amount",
+        sources=[Source(name="orders")],
+        metrics=[
+            Metric(name="m", formula="sum(orders.net_amount)", definition_status=DefinitionStatus.GOVERNED)
+        ],
+        status=RequirementStatus.APPROVED,
+    )
+
+    with pytest.raises(PlatformError) as excinfo:
+        orchestrator.start_run_from_contract(
+            contract=contract,
+            contract_id="rc_no_planner",
+            source_frames={},
+            source_versions={},
+        )
+
+    assert excinfo.value.code == ErrorCode.NO_SAFE_OPERATION
