@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from dataos.compiler.explanation_agent import Audience, ExplanationAgent, ExplanationOutput
 from dataos.compiler.independent_verifier import IndependentVerifier, VerifierResult
 from dataos.compiler.policy_gate import PolicyDecision, PolicyGate
+from dataos.compiler.reconciliation_agent import ReconciliationAgent, ReconciliationReport
 from dataos.compiler.release_gate import ReleaseDecision, ReleaseGate
 from dataos.compiler.validation_rule_generator import CheckSpec, ValidationRuleGenerator
 from dataos.compiler.workflow_planner import PlannerOutput, WorkflowPlanner
@@ -63,12 +64,13 @@ class PlannedRun(BaseModel):
 
 class ReleaseResult(BaseModel):
     """Result of `release()`: the (possibly newly RELEASED/QUARANTINED)
-    run, plus the Validation, Independent Verifier, and Release Gate
-    evidence behind that decision - Prompt Library Section 38 "Persist
-    every agent input/output for audit"."""
+    run, plus the Validation, Reconciliation, Independent Verifier, and
+    Release Gate evidence behind that decision - Prompt Library Section 38
+    "Persist every agent input/output for audit"."""
 
     run: RunRecord
     validation_report: ValidationReport
+    reconciliation_report: ReconciliationReport
     verifier_result: VerifierResult
     release_decision: ReleaseDecision
 
@@ -91,6 +93,7 @@ class WorkflowOrchestrator:
         explainer: ExplanationAgent | None = None,
         rule_generator: ValidationRuleGenerator | None = None,
         rule_executor: ValidationRuleExecutor | None = None,
+        reconciliation_agent: ReconciliationAgent | None = None,
     ) -> None:
         self._registry = registry
         self._run_store = run_store
@@ -102,6 +105,7 @@ class WorkflowOrchestrator:
         self._explainer = explainer
         self._rule_generator = rule_generator or ValidationRuleGenerator()
         self._rule_executor = rule_executor or ValidationRuleExecutor()
+        self._reconciliation_agent = reconciliation_agent or ReconciliationAgent()
 
     def generate_validation_checks(self, workflow: Workflow, contract: RequirementContract) -> list[CheckSpec]:
         """Validation Rule Generator (Section 19). Pure and read-only - it
@@ -156,6 +160,27 @@ class WorkflowOrchestrator:
                 dataframes[rule.stage] = dataframes[source_step_id]
 
         return self._rule_executor.execute(rules, dataframes)
+
+    def reconcile(self, run_id: str, workflow: Workflow, contract: RequirementContract) -> ReconciliationReport:
+        """The other half of the "Validation & Reconciliation" pipeline
+        stage: Independent Reconciliation Agent (Section 20). Loads every
+        artifact any step references (its own output, plus every input it
+        declares) fresh from the artifact store - never trusting a step's
+        own self-reported evidence dict - and hands them to
+        `ReconciliationAgent`."""
+        run = self._run_store.get_run(run_id)
+        if run is None:
+            raise PlatformError(ErrorCode.SCHEMA_MISSING, f"no run with id '{run_id}'")
+
+        needed_refs = {ref for step in workflow.steps for ref in (*step.inputs, step.id)}
+        artifacts: dict[str, pl.DataFrame] = {}
+        for ref in needed_refs:
+            try:
+                artifacts[ref] = self._artifact_store.load_by_ids(run_id, ref)
+            except PlatformError:
+                continue
+
+        return self._reconciliation_agent.reconcile(contract=contract, workflow=workflow, artifacts=artifacts)
 
     def start_run(
         self,
@@ -375,15 +400,16 @@ class WorkflowOrchestrator:
         return self._run_store.update_run_state(run_id, RunState.VERIFYING)
 
     def release(self, run_id: str, workflow: Workflow, contract: RequirementContract) -> ReleaseResult:
-        """Validation & Reconciliation (`validate()`) + Independent
-        Verifier (Section 21) + Release/Quarantine Gate (Section 23):
-        Prompt Library "Agent pipeline" ordering is "... -> Validation &
-        Reconciliation -> Independent Verifier -> Release / Quarantine
-        Gate -> Explanation & Delivery". This is the VERIFYING ->
-        RELEASED/QUARANTINED transition `run()` deliberately never makes
-        itself - Blueprint 9.2 keeps verification and release as a
-        separate step from execution, and Section 23: "You are the only
-        component authorized to mark an analytical result as released."
+        """Validation & Reconciliation (`validate()` + `reconcile()`) +
+        Independent Verifier (Section 21) + Release/Quarantine Gate
+        (Section 23): Prompt Library "Agent pipeline" ordering is
+        "... -> Validation & Reconciliation -> Independent Verifier ->
+        Release / Quarantine Gate -> Explanation & Delivery". This is the
+        VERIFYING -> RELEASED/QUARANTINED transition `run()` deliberately
+        never makes itself - Blueprint 9.2 keeps verification and release
+        as a separate step from execution, and Section 23: "You are the
+        only component authorized to mark an analytical result as
+        released."
 
         Calling this again on an already-RELEASED/QUARANTINED/ROLLED_BACK
         run recomputes the same (pure, deterministic) verdict from the
@@ -396,16 +422,22 @@ class WorkflowOrchestrator:
             raise PlatformError(ErrorCode.SCHEMA_MISSING, f"no run with id '{run_id}'")
 
         validation_report = self.validate(run_id, workflow, contract)
+        reconciliation_report = self.reconcile(run_id, workflow, contract)
         step_runs = self._run_store.list_step_runs(run_id)
         verifier_result = self._verifier.verify(contract=contract, workflow=workflow, run=run, step_runs=step_runs)
         release_decision = self._release_gate.decide(
-            contract=contract, run=run, verifier_result=verifier_result, validation_report=validation_report
+            contract=contract,
+            run=run,
+            verifier_result=verifier_result,
+            validation_report=validation_report,
+            reconciliation_report=reconciliation_report,
         )
 
         if run.state in _RELEASE_TERMINAL_STATES:
             return ReleaseResult(
                 run=run,
                 validation_report=validation_report,
+                reconciliation_report=reconciliation_report,
                 verifier_result=verifier_result,
                 release_decision=release_decision,
             )
@@ -416,6 +448,7 @@ class WorkflowOrchestrator:
         return ReleaseResult(
             run=run,
             validation_report=validation_report,
+            reconciliation_report=reconciliation_report,
             verifier_result=verifier_result,
             release_decision=release_decision,
         )

@@ -580,11 +580,12 @@ def test_release_runs_the_generated_reconciliation_check_and_releases_on_pass(fi
     orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store, planner)
 
     contract = RequirementContract(
-        objective="show total net amount",
+        objective="show total net amount by region",
         sources=[Source(name="orders")],
         metrics=[
             Metric(name="total_amount", formula="sum(orders.net_amount)", definition_status=DefinitionStatus.GOVERNED)
         ],
+        group_by=["region"],  # gives the Reconciliation Agent a real anchor: subtotals sum to the total
         status=RequirementStatus.APPROVED,
     )
 
@@ -602,6 +603,13 @@ def test_release_runs_the_generated_reconciliation_check_and_releases_on_pass(fi
     reconciliation_result = next(r for r in result.validation_report.results if r.check_id == "reconciliation:total_amount")
     assert reconciliation_result.passed is True
     assert reconciliation_result.observed == 825.85  # sum(net_amount) in orders_basic.csv
+
+    assert result.reconciliation_report.status == "PASS"
+    subtotal_test = next(
+        t for t in result.reconciliation_report.tests if t.name == "group_subtotals_sum_to_total:total_amount"
+    )
+    assert subtotal_test.observed == 825.85
+    assert subtotal_test.expected == 825.85
 
 
 def test_release_quarantines_when_a_generated_null_policy_check_fails(fixtures_dir, tmp_path):

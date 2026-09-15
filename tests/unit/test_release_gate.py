@@ -1,4 +1,5 @@
 from dataos.compiler.independent_verifier import RequirementCoverage, VerifierResult
+from dataos.compiler.reconciliation_agent import ReconciliationReport, ReconciliationTest
 from dataos.compiler.release_gate import ReleaseGate
 from dataos.contracts.requirement_contract import RequirementContract, RequirementStatus, Source
 from dataos.workflow.state_machine import RunState
@@ -80,3 +81,48 @@ def test_needs_review_verdict_never_releases():
     decision = ReleaseGate().decide(contract=_approved_contract(), run=_run(), verifier_result=result)
 
     assert decision.decision == "QUARANTINE"
+
+
+def test_quarantines_on_failed_reconciliation():
+    reconciliation_report = ReconciliationReport(
+        status="FAIL",
+        tests=[ReconciliationTest(name="row_count_conservation:s1", passed=False)],
+    )
+    decision = ReleaseGate().decide(
+        contract=_approved_contract(),
+        run=_run(),
+        verifier_result=_passing_verifier_result(),
+        reconciliation_report=reconciliation_report,
+    )
+
+    assert decision.decision == "QUARANTINE"
+    assert any("reconciliation status is 'FAIL'" in r for r in decision.reason_codes)
+    assert "row_count_conservation:s1" in decision.required_remediation
+
+
+def test_quarantines_on_unavailable_reconciliation():
+    reconciliation_report = ReconciliationReport(
+        status="UNAVAILABLE",
+        blocking_reasons=["metric 'revenue' has no independent reconciliation anchor available"],
+    )
+    decision = ReleaseGate().decide(
+        contract=_approved_contract(),
+        run=_run(),
+        verifier_result=_passing_verifier_result(),
+        reconciliation_report=reconciliation_report,
+    )
+
+    assert decision.decision == "QUARANTINE"
+    assert any("reconciliation status is 'UNAVAILABLE'" in r for r in decision.reason_codes)
+
+
+def test_releases_when_reconciliation_passes():
+    reconciliation_report = ReconciliationReport(status="PASS", tests=[ReconciliationTest(name="ok", passed=True)])
+    decision = ReleaseGate().decide(
+        contract=_approved_contract(),
+        run=_run(),
+        verifier_result=_passing_verifier_result(),
+        reconciliation_report=reconciliation_report,
+    )
+
+    assert decision.decision == "RELEASE"

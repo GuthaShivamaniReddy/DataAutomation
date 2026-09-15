@@ -25,6 +25,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from dataos.compiler.independent_verifier import VerifierResult
+from dataos.compiler.reconciliation_agent import ReconciliationReport
 from dataos.contracts.requirement_contract import RequirementContract, RequirementStatus
 from dataos.validation.engine import ValidationReport
 from dataos.workflow.state_machine import RunState
@@ -45,6 +46,7 @@ class ReleaseGate:
         run: RunRecord,
         verifier_result: VerifierResult,
         validation_report: ValidationReport | None = None,
+        reconciliation_report: ReconciliationReport | None = None,
     ) -> ReleaseDecision:
         reason_codes: list[str] = []
         required_remediation: list[str] = []
@@ -63,6 +65,15 @@ class ReleaseGate:
         if validation_report is not None and not validation_report.passed:
             reason_codes.append("one or more blocking validation checks failed")
             required_remediation.extend(f.check_id for f in validation_report.blocking_failures)
+        if reconciliation_report is not None and reconciliation_report.status != "PASS":
+            # Section 20: an UNAVAILABLE reconciliation "requires the
+            # alternative verification policy" - this codebase has no such
+            # policy to satisfy yet, so - per the Constitution's "no
+            # destructive default" bias - UNAVAILABLE blocks release the
+            # same as FAIL, never silently treated as good enough.
+            reason_codes.append(f"reconciliation status is '{reconciliation_report.status}', not PASS")
+            required_remediation.extend(t.name for t in reconciliation_report.tests if not t.passed)
+            required_remediation.extend(reconciliation_report.blocking_reasons)
 
         # Never downgrade a blocking failure to a warning: any reason code
         # forces QUARANTINE outright, regardless of how many others agree.
