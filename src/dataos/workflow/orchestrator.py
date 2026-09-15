@@ -20,7 +20,9 @@ import uuid
 import polars as pl
 from pydantic import BaseModel
 
+from dataos.compiler.independent_verifier import IndependentVerifier, VerifierResult
 from dataos.compiler.policy_gate import PolicyDecision, PolicyGate
+from dataos.compiler.release_gate import ReleaseDecision, ReleaseGate
 from dataos.compiler.workflow_planner import PlannerOutput, WorkflowPlanner
 from dataos.contracts.requirement_contract import RequirementContract
 from dataos.errors import ErrorCode, PlatformError
@@ -55,6 +57,20 @@ class PlannedRun(BaseModel):
     policy_decision: PolicyDecision
 
 
+class ReleaseResult(BaseModel):
+    """Result of `release()`: the (possibly newly RELEASED/QUARANTINED)
+    run, plus the Independent Verifier and Release Gate evidence behind
+    that decision - Prompt Library Section 38 "Persist every agent
+    input/output for audit"."""
+
+    run: RunRecord
+    verifier_result: VerifierResult
+    release_decision: ReleaseDecision
+
+
+_RELEASE_TERMINAL_STATES = frozenset({RunState.RELEASED, RunState.QUARANTINED, RunState.ROLLED_BACK})
+
+
 class WorkflowOrchestrator:
     def __init__(
         self,
@@ -63,12 +79,16 @@ class WorkflowOrchestrator:
         artifact_store: ArtifactStore,
         planner: WorkflowPlanner | None = None,
         policy_gate: PolicyGate | None = None,
+        verifier: IndependentVerifier | None = None,
+        release_gate: ReleaseGate | None = None,
     ) -> None:
         self._registry = registry
         self._run_store = run_store
         self._artifact_store = artifact_store
         self._planner = planner
         self._policy_gate = policy_gate or PolicyGate()
+        self._verifier = verifier or IndependentVerifier()
+        self._release_gate = release_gate or ReleaseGate()
 
     def start_run(
         self,
@@ -286,6 +306,39 @@ class WorkflowOrchestrator:
             )
 
         return self._run_store.update_run_state(run_id, RunState.VERIFYING)
+
+    def release(self, run_id: str, workflow: Workflow, contract: RequirementContract) -> ReleaseResult:
+        """Independent Verifier (Section 21) + Release/Quarantine Gate
+        (Section 23): Prompt Library "Agent pipeline" ordering is
+        "... -> Validation & Reconciliation -> Independent Verifier ->
+        Release / Quarantine Gate -> Explanation & Delivery". This is the
+        VERIFYING -> RELEASED/QUARANTINED transition `run()` deliberately
+        never makes itself - Blueprint 9.2 keeps verification and release
+        as a separate step from execution, and Section 23: "You are the
+        only component authorized to mark an analytical result as
+        released."
+
+        Calling this again on an already-RELEASED/QUARANTINED/ROLLED_BACK
+        run recomputes the same (pure, deterministic) verdict from the
+        recorded step evidence but does not attempt the transition again -
+        `state_machine.transition` has no outgoing edge from a terminal
+        state, so a second real transition attempt would raise.
+        """
+        run = self._run_store.get_run(run_id)
+        if run is None:
+            raise PlatformError(ErrorCode.SCHEMA_MISSING, f"no run with id '{run_id}'")
+
+        step_runs = self._run_store.list_step_runs(run_id)
+        verifier_result = self._verifier.verify(contract=contract, workflow=workflow, run=run, step_runs=step_runs)
+        release_decision = self._release_gate.decide(contract=contract, run=run, verifier_result=verifier_result)
+
+        if run.state in _RELEASE_TERMINAL_STATES:
+            return ReleaseResult(run=run, verifier_result=verifier_result, release_decision=release_decision)
+
+        new_state = RunState.RELEASED if release_decision.decision == "RELEASE" else RunState.QUARANTINED
+        run = self._run_store.update_run_state(run_id, new_state)
+
+        return ReleaseResult(run=run, verifier_result=verifier_result, release_decision=release_decision)
 
     def _fail_step_and_quarantine(self, run_id: str, step_id: str, *, operation_full_id: str, reason: str) -> RunRecord:
         timestamp = now_iso()

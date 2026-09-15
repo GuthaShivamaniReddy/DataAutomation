@@ -343,3 +343,93 @@ def test_start_run_with_export_step_proceeds_when_approved(fixtures_dir, tmp_pat
 
     assert run.state == RunState.VERIFYING
     assert dest.exists()
+
+
+def test_release_after_full_pipeline_reaches_released(fixtures_dir, tmp_path):
+    df = pl.read_csv(fixtures_dir / "orders_basic.csv")
+    version = ingest_file(fixtures_dir / "orders_basic.csv", storage_root=tmp_path / "dataos_store")
+
+    registry = OperationRegistry()
+    registry.register(AggregateOperation())
+
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    planner = WorkflowPlanner(DeterministicLLMClient(), registry)
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store, planner)
+
+    contract = RequirementContract(
+        objective="show order count",
+        sources=[Source(name="orders")],
+        metrics=[
+            Metric(name="order_count", formula="count(orders.order_id)", definition_status=DefinitionStatus.GOVERNED)
+        ],
+        status=RequirementStatus.APPROVED,
+    )
+
+    planned = orchestrator.start_run_from_contract(
+        contract=contract,
+        contract_id="rc_release_test",
+        source_frames={"orders": df},
+        source_versions={"orders": version},
+    )
+    orchestrator.run(planned.run_id, planned.planner_output.workflow)
+
+    result = orchestrator.release(planned.run_id, planned.planner_output.workflow, contract)
+
+    assert result.run.state == RunState.RELEASED
+    assert result.verifier_result.verdict == "PASS"
+    assert result.release_decision.decision == "RELEASE"
+
+    # Calling release() again is a safe no-op: terminal state, no second
+    # transition attempt (which state_machine.transition would reject).
+    again = orchestrator.release(planned.run_id, planned.planner_output.workflow, contract)
+    assert again.run.state == RunState.RELEASED
+
+
+def test_release_quarantines_when_a_declared_metric_is_never_computed(fixtures_dir, tmp_path):
+    df = pl.read_csv(fixtures_dir / "orders_basic.csv")
+    version = ingest_file(fixtures_dir / "orders_basic.csv", storage_root=tmp_path / "dataos_store")
+
+    registry = OperationRegistry()
+    registry.register(AggregateOperation())
+
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    contract = RequirementContract(
+        objective="show order count and total amount",
+        sources=[Source(name="orders")],
+        metrics=[
+            Metric(name="order_count", formula="count(orders.order_id)", definition_status=DefinitionStatus.GOVERNED),
+            Metric(name="total_amount", formula="sum(orders.net_amount)", definition_status=DefinitionStatus.GOVERNED),
+        ],
+        status=RequirementStatus.APPROVED,
+    )
+
+    # The plan only ever computes order_count - total_amount is silently dropped.
+    workflow = Workflow(
+        workflow_version=1,
+        requirement_contract_id="rc_quarantine_test",
+        sources=["orders"],
+        steps=[
+            WorkflowStep(
+                id="s1",
+                operation_id="aggregate",
+                operation_version="1.0",
+                inputs=["source:orders"],
+                params={"metrics": [{"name": "order_count", "column": "order_id", "fn": "count"}]},
+                requirement_refs=["order_count"],
+            )
+        ],
+    )
+
+    run_id = orchestrator.start_run(workflow, source_frames={"orders": df}, source_versions={"orders": version})
+    orchestrator.run(run_id, workflow)
+
+    result = orchestrator.release(run_id, workflow, contract)
+
+    assert result.run.state == RunState.QUARANTINED
+    assert result.verifier_result.verdict == "FAIL"
+    assert any("total_amount" in d for d in result.verifier_result.defects)
+    assert result.release_decision.decision == "QUARANTINE"
