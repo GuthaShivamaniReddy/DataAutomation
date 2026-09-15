@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from dataos.compiler.confidence_scorer import ConfidenceReport, ConfidenceScorer
 from dataos.compiler.explanation_agent import Audience, ExplanationAgent, ExplanationOutput
 from dataos.compiler.independent_verifier import IndependentVerifier, VerifierResult
+from dataos.compiler.pii_classifier import PIIClassifier
 from dataos.compiler.policy_gate import PolicyDecision, PolicyGate
 from dataos.compiler.reconciliation_agent import ReconciliationAgent, ReconciliationReport
 from dataos.compiler.release_gate import ReleaseDecision, ReleaseGate
@@ -104,6 +105,7 @@ class WorkflowOrchestrator:
         drift_monitor: SchemaDriftMonitor | None = None,
         confidence_scorer: ConfidenceScorer | None = None,
         security_guard: SecurityGuard | None = None,
+        pii_classifier: PIIClassifier | None = None,
     ) -> None:
         self._registry = registry
         self._run_store = run_store
@@ -119,6 +121,7 @@ class WorkflowOrchestrator:
         self._drift_monitor = drift_monitor or SchemaDriftMonitor()
         self._confidence_scorer = confidence_scorer or ConfidenceScorer()
         self._security_guard = security_guard or SecurityGuard()
+        self._pii_classifier = pii_classifier or PIIClassifier()
 
     def check_drift(
         self,
@@ -595,6 +598,7 @@ class WorkflowOrchestrator:
         metrics_context = []
         known_refs: set[str] = set()
         sanitized_locations: list[str] = []
+        masked_fields: list[str] = []
         for metric in contract.metrics:
             covering_steps = [s for s in workflow.steps if metric.name in s.requirement_refs]
             if not covering_steps:
@@ -605,6 +609,17 @@ class WorkflowOrchestrator:
                 continue
             output_df = self._artifact_store.load_by_ids(run_id, step.id)
             sample_df = output_df.head(sample_rows)
+
+            # Section 28 PII Classifier: applied first, before any other
+            # processing, so a sensitive value is masked/dropped before
+            # anything downstream (including the security scan below) has
+            # a chance to see it - "applies privacy controls before data
+            # is sent to models."
+            pii_report = self._pii_classifier.classify_dataframe(sample_df)
+            fields_needing_masking = [f.field for f in pii_report.fields if f.model_access != "ALLOW"]
+            if fields_needing_masking:
+                sample_df = self._pii_classifier.mask_for_model(sample_df, pii_report)
+                masked_fields.extend(f"{step.id}.{field}" for field in fields_needing_masking)
 
             # Section 27 Security Guard: this is the only place actual
             # data cell values are placed into an LLM prompt in this
@@ -639,6 +654,11 @@ class WorkflowOrchestrator:
         }
 
         forced_limitations = list(verifier_result.unverified_claims)
+        if masked_fields:
+            forced_limitations.append(
+                "some released fields were classified as sensitive and masked or withheld before being "
+                f"sent to the explanation model: {masked_fields}"
+            )
         if sanitized_locations:
             forced_limitations.append(
                 "some released data values matched an instruction-like or code-payload pattern and were "

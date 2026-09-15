@@ -788,6 +788,52 @@ def test_start_run_skips_drift_check_when_no_baseline_supplied(fixtures_dir, tmp
     assert run_id
 
 
+def test_explain_masks_pii_fields_before_sending_to_the_llm(tmp_path):
+    src_path = tmp_path / "customers.csv"
+    src_path.write_text("order_id,email,region\n1,alice@example.com,East\n", encoding="utf-8")
+    df = pl.read_csv(src_path)
+    version = ingest_file(src_path, storage_root=tmp_path / "dataos_store")
+
+    registry = OperationRegistry()
+    registry.register(SelectFilterOperation())
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    explainer = ExplanationAgent(DeterministicLLMClient())
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store, explainer=explainer)
+
+    contract = RequirementContract(
+        objective="show region",
+        sources=[Source(name="orders")],
+        metrics=[Metric(name="region", formula="region", definition_status=DefinitionStatus.GOVERNED)],
+        status=RequirementStatus.APPROVED,
+    )
+    workflow = Workflow(
+        workflow_version=1,
+        requirement_contract_id="rc_pii_test",
+        sources=["orders"],
+        steps=[
+            WorkflowStep(
+                id="s1",
+                operation_id="select_filter",
+                operation_version="1.0",
+                inputs=["source:orders"],
+                requirement_refs=["region"],
+            )
+        ],
+    )
+
+    run_id = orchestrator.start_run(workflow, source_frames={"orders": df}, source_versions={"orders": version})
+    orchestrator.run(run_id, workflow)
+    orchestrator.release(run_id, workflow, contract)
+
+    output = orchestrator.explain(run_id, workflow, contract)
+
+    finding = output.explanation.findings[0]
+    assert finding.statement == "region is East."
+    assert "alice@example.com" not in str(output.explanation.model_dump())  # never leaked to the model or the output
+    assert any("s1.email" in limitation for limitation in output.explanation.limitations)
+
+
 def test_explain_marks_injection_looking_data_as_untrusted_before_sending_to_the_llm(tmp_path):
     src_path = tmp_path / "notes.csv"
     src_path.write_text(
