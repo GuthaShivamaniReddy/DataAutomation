@@ -20,6 +20,7 @@ import uuid
 import polars as pl
 from pydantic import BaseModel
 
+from dataos.compiler.explanation_agent import Audience, ExplanationAgent, ExplanationOutput
 from dataos.compiler.independent_verifier import IndependentVerifier, VerifierResult
 from dataos.compiler.policy_gate import PolicyDecision, PolicyGate
 from dataos.compiler.release_gate import ReleaseDecision, ReleaseGate
@@ -81,6 +82,7 @@ class WorkflowOrchestrator:
         policy_gate: PolicyGate | None = None,
         verifier: IndependentVerifier | None = None,
         release_gate: ReleaseGate | None = None,
+        explainer: ExplanationAgent | None = None,
     ) -> None:
         self._registry = registry
         self._run_store = run_store
@@ -89,6 +91,7 @@ class WorkflowOrchestrator:
         self._policy_gate = policy_gate or PolicyGate()
         self._verifier = verifier or IndependentVerifier()
         self._release_gate = release_gate or ReleaseGate()
+        self._explainer = explainer
 
     def start_run(
         self,
@@ -339,6 +342,92 @@ class WorkflowOrchestrator:
         run = self._run_store.update_run_state(run_id, new_state)
 
         return ReleaseResult(run=run, verifier_result=verifier_result, release_decision=release_decision)
+
+    def explain(
+        self,
+        run_id: str,
+        workflow: Workflow,
+        contract: RequirementContract,
+        *,
+        audience: Audience = "analyst",
+        sample_rows: int = 20,
+    ) -> ExplanationOutput:
+        """Report & Explanation Agent (Section 18), the last stage of the
+        pipeline: "... -> Release / Quarantine Gate -> Explanation &
+        Delivery". Only ever callable on a RELEASED run - Section 18:
+        "Write the user-facing answer using only RELEASED result objects
+        and evidence supplied to you."
+
+        Builds the evidence context itself (contract framing + a bounded
+        sample of each covered metric's actual released output rows, read
+        from the artifact store) rather than delegating that to the
+        agent, matching Section 38 "Runtime context discipline": only the
+        artifact-derived evidence needed to write about *this* run is
+        sent, never raw source data. Independently re-runs the Verifier
+        (cheap and pure) so any `unverified_claims` are force-included as
+        limitations - Section 18 rule 8: "Do not hide validation
+        warnings" - rather than trusted to a stale, previously-computed
+        verdict.
+        """
+        if self._explainer is None:
+            raise PlatformError(
+                ErrorCode.NO_SAFE_OPERATION,
+                "orchestrator was constructed without an ExplanationAgent; pass one to call explain()",
+            )
+
+        run = self._run_store.get_run(run_id)
+        if run is None:
+            raise PlatformError(ErrorCode.SCHEMA_MISSING, f"no run with id '{run_id}'")
+        if run.state != RunState.RELEASED:
+            raise PlatformError(
+                ErrorCode.VALIDATION_FAIL,
+                "cannot explain a run that is not RELEASED",
+                evidence={"run_id": run_id, "state": run.state.value},
+            )
+
+        all_step_runs = self._run_store.list_step_runs(run_id)
+        step_runs = {s.step_id: s for s in all_step_runs}
+        verifier_result = self._verifier.verify(contract=contract, workflow=workflow, run=run, step_runs=all_step_runs)
+
+        metrics_context = []
+        known_refs: set[str] = set()
+        for metric in contract.metrics:
+            covering_steps = [s for s in workflow.steps if metric.name in s.requirement_refs]
+            if not covering_steps:
+                continue
+            step = covering_steps[0]
+            record = step_runs.get(step.id)
+            if record is None or record.status != "COMPLETED":
+                continue
+            output_df = self._artifact_store.load_by_ids(run_id, step.id)
+            sample_records = output_df.head(sample_rows).to_dicts()
+            metrics_context.append(
+                {
+                    "name": metric.name,
+                    "formula": metric.formula,
+                    "step_id": step.id,
+                    "sample_records": sample_records,
+                }
+            )
+            known_refs.add(metric.name)
+            known_refs.add(step.id)
+
+        evidence_context = {
+            "objective": contract.objective,
+            "grain": contract.grain,
+            "filters": contract.filters,
+            "time": contract.time.model_dump(),
+            "units": contract.units.model_dump(),
+            "metrics": metrics_context,
+        }
+
+        return self._explainer.explain(
+            run_id=run_id,
+            evidence_context=evidence_context,
+            known_evidence_refs=frozenset(known_refs),
+            forced_limitations=verifier_result.unverified_claims,
+            audience=audience,
+        )
 
     def _fail_step_and_quarantine(self, run_id: str, step_id: str, *, operation_full_id: str, reason: str) -> RunRecord:
         timestamp = now_iso()

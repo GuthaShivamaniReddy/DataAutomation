@@ -1,6 +1,7 @@
 import polars as pl
 import pytest
 
+from dataos.compiler.explanation_agent import ExplanationAgent
 from dataos.compiler.workflow_planner import WorkflowPlanner
 from dataos.contracts.requirement_contract import (
     DefinitionStatus,
@@ -433,3 +434,103 @@ def test_release_quarantines_when_a_declared_metric_is_never_computed(fixtures_d
     assert result.verifier_result.verdict == "FAIL"
     assert any("total_amount" in d for d in result.verifier_result.defects)
     assert result.release_decision.decision == "QUARANTINE"
+
+
+def _released_run(fixtures_dir, tmp_path):
+    df = pl.read_csv(fixtures_dir / "orders_basic.csv")
+    version = ingest_file(fixtures_dir / "orders_basic.csv", storage_root=tmp_path / "dataos_store")
+
+    registry = OperationRegistry()
+    registry.register(AggregateOperation())
+
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    planner = WorkflowPlanner(DeterministicLLMClient(), registry)
+    explainer = ExplanationAgent(DeterministicLLMClient())
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store, planner, explainer=explainer)
+
+    contract = RequirementContract(
+        objective="show order count",
+        sources=[Source(name="orders")],
+        metrics=[
+            Metric(name="order_count", formula="count(orders.order_id)", definition_status=DefinitionStatus.GOVERNED)
+        ],
+        status=RequirementStatus.APPROVED,
+    )
+
+    planned = orchestrator.start_run_from_contract(
+        contract=contract,
+        contract_id="rc_explain_test",
+        source_frames={"orders": df},
+        source_versions={"orders": version},
+    )
+    orchestrator.run(planned.run_id, planned.planner_output.workflow)
+    orchestrator.release(planned.run_id, planned.planner_output.workflow, contract)
+
+    return orchestrator, planned, contract
+
+
+def test_explain_after_release_produces_a_grounded_finding(fixtures_dir, tmp_path):
+    orchestrator, planned, contract = _released_run(fixtures_dir, tmp_path)
+
+    output = orchestrator.explain(planned.run_id, planned.planner_output.workflow, contract)
+
+    assert output.explanation.findings
+    finding = output.explanation.findings[0]
+    assert finding.statement == "order_count is 5."
+    assert "order_count" in finding.evidence_refs
+    assert output.envelope.status == "OK"
+
+
+def test_explain_refuses_a_run_that_is_not_released(fixtures_dir, tmp_path):
+    df = pl.read_csv(fixtures_dir / "orders_basic.csv")
+    version = ingest_file(fixtures_dir / "orders_basic.csv", storage_root=tmp_path / "dataos_store")
+
+    registry = OperationRegistry()
+    registry.register(AggregateOperation())
+
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    planner = WorkflowPlanner(DeterministicLLMClient(), registry)
+    explainer = ExplanationAgent(DeterministicLLMClient())
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store, planner, explainer=explainer)
+
+    contract = RequirementContract(
+        objective="show order count",
+        sources=[Source(name="orders")],
+        metrics=[
+            Metric(name="order_count", formula="count(orders.order_id)", definition_status=DefinitionStatus.GOVERNED)
+        ],
+        status=RequirementStatus.APPROVED,
+    )
+
+    planned = orchestrator.start_run_from_contract(
+        contract=contract,
+        contract_id="rc_not_released_test",
+        source_frames={"orders": df},
+        source_versions={"orders": version},
+    )
+    orchestrator.run(planned.run_id, planned.planner_output.workflow)  # reaches VERIFYING, never released
+
+    with pytest.raises(PlatformError) as excinfo:
+        orchestrator.explain(planned.run_id, planned.planner_output.workflow, contract)
+
+    assert excinfo.value.code == ErrorCode.VALIDATION_FAIL
+
+
+def test_explain_without_explainer_raises(fixtures_dir, tmp_path):
+    _orchestrator, planned, contract = _released_run(fixtures_dir, tmp_path)
+
+    # A second orchestrator over the same on-disk run/artifact stores, but
+    # built without an ExplanationAgent - e.g. a caller with no LLM
+    # configured for this stage.
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    registry = OperationRegistry()
+    registry.register(AggregateOperation())
+    orchestrator_without_explainer = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    with pytest.raises(PlatformError) as excinfo:
+        orchestrator_without_explainer.explain(planned.run_id, planned.planner_output.workflow, contract)
+
+    assert excinfo.value.code == ErrorCode.NO_SAFE_OPERATION

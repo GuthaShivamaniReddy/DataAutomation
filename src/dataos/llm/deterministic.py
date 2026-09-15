@@ -2,12 +2,12 @@
 
 This is explicitly a test double, not a real natural-language
 understanding engine. It exists so the compiler pipeline (Requirement
-Compiler -> Ambiguity Gate -> Semantic Resolver -> Workflow Planner) can
-be built and tested today, with zero network access, before any real
-model is wired in (AnthropicLLMClient, added alongside this, is
-unused/untested until an API key is supplied).
+Compiler -> Ambiguity Gate -> Semantic Resolver -> Workflow Planner ->
+... -> Explanation Agent) can be built and tested today, with zero network
+access, before any real model is wired in (AnthropicLLMClient, added
+alongside this, is unused/untested until an API key is supplied).
 
-Deliberately "dumb" for both response models it supports:
+Deliberately "dumb" for every response model it supports:
   - `RawExtraction`: every extracted metric term is reported with no
     claimed confidence beyond bare extraction. It never decides whether a
     term is governed, ambiguous, or safe to proceed with - that decision
@@ -17,9 +17,13 @@ Deliberately "dumb" for both response models it supports:
   - `RawPlan`: only proposes a single `aggregate` step, and only for
     metrics whose already-resolved formula matches a plain `fn(table.col)`
     shape - it does not attempt joins, cleaning, or multi-step plans.
+  - `RawExplanation`: one FACT finding per metric already present in the
+    evidence context, reading the value straight off the first sample
+    record - it never interprets, forecasts, or writes prose beyond a
+    templated sentence.
 Using genuinely naive rules here keeps the tests honest: they exercise the
 pipeline's safety logic (registry validation, DAG validation, ambiguity
-blocking), not a hand-tuned fake AI.
+blocking, evidence-ref validation), not a hand-tuned fake AI.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ import re
 import uuid
 
 from dataos.compiler.extraction import ExtractedMetric, RawExtraction
+from dataos.compiler.raw_explanation import Finding, RawExplanation
 from dataos.compiler.raw_plan import RawPlan, RawPlanStep
 from dataos.errors import ErrorCode, PlatformError
 from dataos.llm.client import LLMClient, T
@@ -55,7 +60,7 @@ _TIMEZONE_HINT = re.compile(r"\b(UTC|GMT|[A-Za-z_]+/[A-Za-z_]+)\b")
 # the same "leave it to a real model" boundary the extraction side draws.
 _SIMPLE_METRIC_FORMULA = re.compile(r"^(sum|count|mean|min|max|n_unique)\(\w+\.(\w+)\)$")
 
-_SUPPORTED_RESPONSE_MODELS = (RawExtraction, RawPlan)
+_SUPPORTED_RESPONSE_MODELS = (RawExtraction, RawPlan, RawExplanation)
 
 
 class DeterministicLLMClient(LLMClient):
@@ -64,6 +69,8 @@ class DeterministicLLMClient(LLMClient):
             return self._extract(user_prompt)  # type: ignore[return-value]
         if response_model is RawPlan:
             return self._plan(user_prompt)  # type: ignore[return-value]
+        if response_model is RawExplanation:
+            return self._explain(user_prompt)  # type: ignore[return-value]
         raise PlatformError(
             ErrorCode.MODEL_OUTPUT_INVALID,
             (
@@ -131,4 +138,35 @@ class DeterministicLLMClient(LLMClient):
             plan_id=plan_id,
             steps=[step],
             final_acceptance_tests=context.get("acceptance_tests", []),
+        )
+
+    def _explain(self, context_json: str) -> RawExplanation:
+        """`context_json` is the compact JSON `WorkflowOrchestrator.explain`
+        renders from already-RELEASED evidence - see that method for the
+        `metrics` shape (`name`, `step_id`, `sample_records`)."""
+        context = json.loads(context_json)
+        metrics = context.get("metrics", [])
+
+        findings = []
+        for metric in metrics:
+            samples = metric.get("sample_records") or []
+            if not samples:
+                continue
+            value = samples[0].get(metric["name"])
+            if value is None:
+                continue
+            findings.append(
+                Finding(
+                    statement=f"{metric['name']} is {value}.",
+                    type="FACT",
+                    evidence_refs=[metric["name"], metric["step_id"]],
+                )
+            )
+
+        summary = "; ".join(f.statement for f in findings) if findings else "No released metrics to report."
+        return RawExplanation(
+            summary=summary,
+            findings=findings,
+            limitations=list(context.get("warnings", [])),
+            method_note="Computed via the registered deterministic operation(s) in this workflow.",
         )
