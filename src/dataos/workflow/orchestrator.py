@@ -27,6 +27,7 @@ from dataos.compiler.policy_gate import PolicyDecision, PolicyGate
 from dataos.compiler.reconciliation_agent import ReconciliationAgent, ReconciliationReport
 from dataos.compiler.release_gate import ReleaseDecision, ReleaseGate
 from dataos.compiler.schema_drift_monitor import DriftReport, SchemaDriftMonitor
+from dataos.compiler.security_guard import SecurityGuard
 from dataos.compiler.validation_rule_generator import CheckSpec, ValidationRuleGenerator
 from dataos.compiler.workflow_planner import PlannerOutput, WorkflowPlanner
 from dataos.contracts.requirement_contract import RequirementContract
@@ -102,6 +103,7 @@ class WorkflowOrchestrator:
         reconciliation_agent: ReconciliationAgent | None = None,
         drift_monitor: SchemaDriftMonitor | None = None,
         confidence_scorer: ConfidenceScorer | None = None,
+        security_guard: SecurityGuard | None = None,
     ) -> None:
         self._registry = registry
         self._run_store = run_store
@@ -116,6 +118,7 @@ class WorkflowOrchestrator:
         self._reconciliation_agent = reconciliation_agent or ReconciliationAgent()
         self._drift_monitor = drift_monitor or SchemaDriftMonitor()
         self._confidence_scorer = confidence_scorer or ConfidenceScorer()
+        self._security_guard = security_guard or SecurityGuard()
 
     def check_drift(
         self,
@@ -420,6 +423,25 @@ class WorkflowOrchestrator:
 
             input_df = self._artifact_store.load_by_ids(run_id, step.inputs[0])
 
+            if step.operation_id == "export":
+                # Section 27 Security Guard, defense in depth ahead of
+                # ExportOperation's own "'..'" precondition check: also
+                # rejects an unapproved destination scheme, and defuses
+                # CSV/Excel formula-injection payloads in the data itself
+                # before it is ever written to a file a user might open.
+                destination_path = step.params.get("destination_path", "") if isinstance(step.params, dict) else ""
+                path_report = self._security_guard.scan_destination_path(str(destination_path))
+                if path_report.decision == "BLOCK":
+                    return self._fail_step_and_quarantine(
+                        run_id,
+                        step_id,
+                        operation_full_id=step.full_operation_id,
+                        reason=f"export destination blocked by the security guard: {destination_path!r}",
+                        error_code=ErrorCode.POLICY_DENIED,
+                        evidence={"flags": [f.model_dump() for f in path_report.flags]},
+                    )
+                input_df = self._security_guard.defuse_formula_injection(input_df)
+
             started_at = now_iso()
             self._run_store.upsert_step_run(
                 StepRunRecord(run_id=run_id, step_id=step_id, status="RUNNING", started_at=started_at)
@@ -572,6 +594,7 @@ class WorkflowOrchestrator:
 
         metrics_context = []
         known_refs: set[str] = set()
+        sanitized_locations: list[str] = []
         for metric in contract.metrics:
             covering_steps = [s for s in workflow.steps if metric.name in s.requirement_refs]
             if not covering_steps:
@@ -581,13 +604,26 @@ class WorkflowOrchestrator:
             if record is None or record.status != "COMPLETED":
                 continue
             output_df = self._artifact_store.load_by_ids(run_id, step.id)
-            sample_records = output_df.head(sample_rows).to_dicts()
+            sample_df = output_df.head(sample_rows)
+
+            # Section 27 Security Guard: this is the only place actual
+            # data cell values are placed into an LLM prompt in this
+            # codebase - any value that reads like an instruction gets
+            # wrapped in explicit untrusted-content delimiters
+            # (Constitution 8.1) before it is ever sent, never dropped or
+            # rewritten otherwise.
+            security_report = self._security_guard.scan_dataframe(sample_df, location_prefix=f"{step.id}.")
+            if security_report.decision != "ALLOW":
+                flagged_columns = {loc.split(".", 1)[1] for loc in security_report.sanitized_refs}
+                sample_df = self._security_guard.mark_untrusted_columns(sample_df, flagged_columns)
+                sanitized_locations.extend(security_report.sanitized_refs)
+
             metrics_context.append(
                 {
                     "name": metric.name,
                     "formula": metric.formula,
                     "step_id": step.id,
-                    "sample_records": sample_records,
+                    "sample_records": sample_df.to_dicts(),
                 }
             )
             known_refs.add(metric.name)
@@ -602,15 +638,31 @@ class WorkflowOrchestrator:
             "metrics": metrics_context,
         }
 
+        forced_limitations = list(verifier_result.unverified_claims)
+        if sanitized_locations:
+            forced_limitations.append(
+                "some released data values matched an instruction-like or code-payload pattern and were "
+                f"marked as untrusted content before being sent to the explanation model: {sanitized_locations}"
+            )
+
         return self._explainer.explain(
             run_id=run_id,
             evidence_context=evidence_context,
             known_evidence_refs=frozenset(known_refs),
-            forced_limitations=verifier_result.unverified_claims,
+            forced_limitations=forced_limitations,
             audience=audience,
         )
 
-    def _fail_step_and_quarantine(self, run_id: str, step_id: str, *, operation_full_id: str, reason: str) -> RunRecord:
+    def _fail_step_and_quarantine(
+        self,
+        run_id: str,
+        step_id: str,
+        *,
+        operation_full_id: str,
+        reason: str,
+        error_code: ErrorCode = ErrorCode.VALIDATION_FAIL,
+        evidence: dict | None = None,
+    ) -> RunRecord:
         timestamp = now_iso()
         self._run_store.upsert_step_run(
             StepRunRecord(
@@ -618,7 +670,7 @@ class WorkflowOrchestrator:
                 step_id=step_id,
                 status="FAILED",
                 operation_full_id=operation_full_id,
-                error={"code": ErrorCode.VALIDATION_FAIL.value, "reason": reason, "evidence": {}},
+                error={"code": error_code.value, "reason": reason, "evidence": evidence or {}},
                 started_at=timestamp,
                 completed_at=timestamp,
             )
