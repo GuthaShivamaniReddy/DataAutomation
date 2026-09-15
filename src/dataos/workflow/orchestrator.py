@@ -21,6 +21,7 @@ import polars as pl
 from pydantic import BaseModel
 
 from dataos.compiler.confidence_scorer import ConfidenceReport, ConfidenceScorer
+from dataos.compiler.connector_planner import ConnectorWritePlanner, ExternalActionPlan, ExternalActionVerification
 from dataos.compiler.explanation_agent import Audience, ExplanationAgent, ExplanationOutput
 from dataos.compiler.independent_verifier import IndependentVerifier, VerifierResult
 from dataos.compiler.pii_classifier import PIIClassifier
@@ -106,6 +107,7 @@ class WorkflowOrchestrator:
         confidence_scorer: ConfidenceScorer | None = None,
         security_guard: SecurityGuard | None = None,
         pii_classifier: PIIClassifier | None = None,
+        connector_planner: ConnectorWritePlanner | None = None,
     ) -> None:
         self._registry = registry
         self._run_store = run_store
@@ -122,6 +124,7 @@ class WorkflowOrchestrator:
         self._confidence_scorer = confidence_scorer or ConfidenceScorer()
         self._security_guard = security_guard or SecurityGuard()
         self._pii_classifier = pii_classifier or PIIClassifier()
+        self._connector_planner = connector_planner
 
     def check_drift(
         self,
@@ -159,6 +162,37 @@ class WorkflowOrchestrator:
         `Workflow` exists (typically right after planning, before or
         alongside `run()`)."""
         return self._rule_generator.generate(contract=contract, workflow=workflow)
+
+    def plan_external_actions(self, workflow: Workflow) -> list[ExternalActionPlan]:
+        """Connector / External Write Planner (Section 29). Pure and
+        read-only - produces the least-privilege action plan for a
+        workflow's write-capable steps but does not execute or gate
+        anything itself (`PolicyGate`, enforced at `start_run`, remains
+        the actual approval gate regardless of whether anyone reads this
+        plan). Callable any time after a `Workflow` exists."""
+        if self._connector_planner is None:
+            raise PlatformError(
+                ErrorCode.NO_SAFE_OPERATION,
+                "orchestrator was constructed without a ConnectorWritePlanner; pass one to call plan_external_actions()",
+            )
+        return self._connector_planner.plan(workflow)
+
+    def verify_external_actions(self, run_id: str, workflow: Workflow) -> list[ExternalActionVerification]:
+        """Independent post-write verification for every planned external
+        action: re-derives its answer from the real StepRunRecords this
+        run produced, never from the plan alone."""
+        if self._connector_planner is None:
+            raise PlatformError(
+                ErrorCode.NO_SAFE_OPERATION,
+                "orchestrator was constructed without a ConnectorWritePlanner; pass one to call verify_external_actions()",
+            )
+        run = self._run_store.get_run(run_id)
+        if run is None:
+            raise PlatformError(ErrorCode.SCHEMA_MISSING, f"no run with id '{run_id}'")
+
+        plans = self._connector_planner.plan(workflow)
+        step_runs = {s.step_id: s for s in self._run_store.list_step_runs(run_id)}
+        return self._connector_planner.verify(plans, step_runs)
 
     def validate(self, run_id: str, workflow: Workflow, contract: RequirementContract) -> ValidationReport:
         """"Validation & Reconciliation" pipeline stage: generates the

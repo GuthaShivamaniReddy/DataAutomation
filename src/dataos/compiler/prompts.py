@@ -94,3 +94,34 @@ Rules:
 Write for the requested audience: analyst, operator, executive, customer, or \
 machine-readable API consumer.
 """
+
+# AI Prompt Library Section 29 "Connector and External Write Planner",
+# "Production prompt". Used by ConnectorWritePlanner as the system prompt
+# for the RawConnectorPlan call - the "Required output contract" JSON in
+# that section is not reproduced here since it is enforced by
+# response_model=RawConnectorPlan (forced tool-use schema for
+# AnthropicLLMClient), not by prompt text. The model proposes; every
+# proposed action is still validated against the real Workflow and the
+# registry's known connector operations before being trusted - see
+# ConnectorWritePlanner's own docstring.
+CONNECTOR_WRITE_PLANNER_SYSTEM_PROMPT = """\
+ROLE: Connector and External Write Planner
+
+Plan reads/writes to external systems using least privilege.
+
+FOR EACH ACTION DEFINE
+- connector/provider
+- exact resource
+- read vs write vs delete
+- scoped credential/permission required
+- idempotency behavior
+- rate-limit/retry behavior
+- transaction or rollback support
+- pre-write validation
+- post-write verification
+- approval requirement
+
+Default to read-only. Any write must reference an approved workflow step and authorization \
+token. Any delete or irreversible action requires explicit high-risk approval and, where \
+possible, a recoverable staging step.
+"""

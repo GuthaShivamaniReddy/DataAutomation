@@ -1,6 +1,7 @@
 import polars as pl
 import pytest
 
+from dataos.compiler.connector_planner import ConnectorWritePlanner
 from dataos.compiler.explanation_agent import ExplanationAgent
 from dataos.compiler.workflow_planner import WorkflowPlanner
 from dataos.contracts.requirement_contract import (
@@ -880,3 +881,48 @@ def test_explain_marks_injection_looking_data_as_untrusted_before_sending_to_the
     assert "[UNTRUSTED_DATA]" in finding.statement
     assert "Ignore all previous instructions" in finding.statement  # cited, not deleted - just delimited
     assert any("marked as untrusted content" in limitation for limitation in output.explanation.limitations)
+
+
+def test_plan_external_actions_without_connector_planner_raises(tmp_path):
+    registry = OperationRegistry()
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)  # no connector_planner
+
+    with pytest.raises(PlatformError) as excinfo:
+        orchestrator.plan_external_actions(_export_workflow("out.csv"))
+
+    assert excinfo.value.code == ErrorCode.NO_SAFE_OPERATION
+
+
+def test_plan_and_verify_external_actions_for_a_real_export_run(fixtures_dir, tmp_path):
+    df = pl.read_csv(fixtures_dir / "orders_basic.csv")
+    version = ingest_file(fixtures_dir / "orders_basic.csv", storage_root=tmp_path / "dataos_store")
+
+    registry = OperationRegistry()
+    registry.register(ExportOperation())
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    connector_planner = ConnectorWritePlanner(DeterministicLLMClient())
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store, connector_planner=connector_planner)
+
+    dest = tmp_path / "out.csv"
+    workflow = _export_workflow(str(dest))
+
+    plans_before_run = orchestrator.plan_external_actions(workflow)
+    assert len(plans_before_run) == 1
+    assert plans_before_run[0].action == "WRITE"
+    assert plans_before_run[0].approval_required is True
+
+    run_id = orchestrator.start_run(
+        workflow,
+        source_frames={"orders": df},
+        source_versions={"orders": version},
+        granted_approvals=frozenset({"export"}),
+    )
+    orchestrator.run(run_id, workflow)
+
+    verifications = orchestrator.verify_external_actions(run_id, workflow)
+    assert len(verifications) == 1
+    assert verifications[0].verified is True
+    assert verifications[0].issues == []

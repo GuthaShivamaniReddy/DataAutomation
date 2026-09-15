@@ -21,6 +21,11 @@ Deliberately "dumb" for every response model it supports:
     evidence context, reading the value straight off the first sample
     record - it never interprets, forecasts, or writes prose beyond a
     templated sentence.
+  - `RawConnectorPlan`: echoes each candidate step's already-supplied
+    resource back into a templated scope/idempotency sentence and leaves
+    prechecks/postchecks empty - it never adds real narrative detail,
+    relying entirely on `ConnectorWritePlanner`'s own hardcoded safety
+    floor for anything that actually matters.
 Using genuinely naive rules here keeps the tests honest: they exercise the
 pipeline's safety logic (registry validation, DAG validation, ambiguity
 blocking, evidence-ref validation), not a hand-tuned fake AI.
@@ -33,6 +38,7 @@ import re
 import uuid
 
 from dataos.compiler.extraction import ExtractedMetric, RawExtraction
+from dataos.compiler.raw_connector_plan import RawConnectorPlan, RawExternalAction
 from dataos.compiler.raw_explanation import Finding, RawExplanation
 from dataos.compiler.raw_plan import RawPlan, RawPlanStep
 from dataos.errors import ErrorCode, PlatformError
@@ -60,7 +66,7 @@ _TIMEZONE_HINT = re.compile(r"\b(UTC|GMT|[A-Za-z_]+/[A-Za-z_]+)\b")
 # the same "leave it to a real model" boundary the extraction side draws.
 _SIMPLE_METRIC_FORMULA = re.compile(r"^(sum|count|mean|min|max|n_unique)\(\w+\.(\w+)\)$")
 
-_SUPPORTED_RESPONSE_MODELS = (RawExtraction, RawPlan, RawExplanation)
+_SUPPORTED_RESPONSE_MODELS = (RawExtraction, RawPlan, RawExplanation, RawConnectorPlan)
 
 
 class DeterministicLLMClient(LLMClient):
@@ -71,6 +77,8 @@ class DeterministicLLMClient(LLMClient):
             return self._plan(user_prompt)  # type: ignore[return-value]
         if response_model is RawExplanation:
             return self._explain(user_prompt)  # type: ignore[return-value]
+        if response_model is RawConnectorPlan:
+            return self._plan_connector_actions(user_prompt)  # type: ignore[return-value]
         raise PlatformError(
             ErrorCode.MODEL_OUTPUT_INVALID,
             (
@@ -170,3 +178,22 @@ class DeterministicLLMClient(LLMClient):
             limitations=list(context.get("warnings", [])),
             method_note="Computed via the registered deterministic operation(s) in this workflow.",
         )
+
+    def _plan_connector_actions(self, context_json: str) -> RawConnectorPlan:
+        """`context_json` is the compact JSON `ConnectorWritePlanner.plan`
+        renders - one entry per candidate step, already carrying its
+        resolved `resource`. This double only echoes that back into a
+        templated sentence; it adds no prechecks/postchecks of its own,
+        relying entirely on the caller's own hardcoded safety floor."""
+        context = json.loads(context_json)
+        actions = [
+            RawExternalAction(
+                step_id=step["step_id"],
+                scope=f"filesystem write access to '{step.get('resource', '<unresolved>')}' and its parent directory only",
+                idempotency="overwrites the destination path deterministically",
+                rate_limit_retry="not applicable - local filesystem write",
+                transactional=False,
+            )
+            for step in context.get("steps", [])
+        ]
+        return RawConnectorPlan(actions=actions)
