@@ -381,6 +381,10 @@ def test_release_after_full_pipeline_reaches_released(fixtures_dir, tmp_path):
     assert result.run.state == RunState.RELEASED
     assert result.verifier_result.verdict == "PASS"
     assert result.release_decision.decision == "RELEASE"
+    assert result.confidence_report.overall_status == "RELEASABLE"
+    assert result.confidence_report.scores.requirements == 1.0
+    assert result.confidence_report.scores.execution == 1.0
+    assert result.confidence_report.critical_failures == []
 
     # Calling release() again is a safe no-op: terminal state, no second
     # transition attempt (which state_machine.transition would reject).
@@ -435,6 +439,9 @@ def test_release_quarantines_when_a_declared_metric_is_never_computed(fixtures_d
     assert result.verifier_result.verdict == "FAIL"
     assert any("total_amount" in d for d in result.verifier_result.defects)
     assert result.release_decision.decision == "QUARANTINE"
+    # Section 22: overall_status must never be more lenient than the hard gates.
+    assert result.confidence_report.overall_status == "NOT_RELEASABLE"
+    assert result.confidence_report.critical_failures == result.release_decision.reason_codes
 
 
 def _released_run(fixtures_dir, tmp_path):

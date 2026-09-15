@@ -20,6 +20,7 @@ import uuid
 import polars as pl
 from pydantic import BaseModel
 
+from dataos.compiler.confidence_scorer import ConfidenceReport, ConfidenceScorer
 from dataos.compiler.explanation_agent import Audience, ExplanationAgent, ExplanationOutput
 from dataos.compiler.independent_verifier import IndependentVerifier, VerifierResult
 from dataos.compiler.policy_gate import PolicyDecision, PolicyGate
@@ -67,15 +68,17 @@ class PlannedRun(BaseModel):
 
 class ReleaseResult(BaseModel):
     """Result of `release()`: the (possibly newly RELEASED/QUARANTINED)
-    run, plus the Validation, Reconciliation, Independent Verifier, and
-    Release Gate evidence behind that decision - Prompt Library Section 38
-    "Persist every agent input/output for audit"."""
+    run, plus the Validation, Reconciliation, Independent Verifier,
+    Release Gate, and Confidence Scorer evidence behind that decision -
+    Prompt Library Section 38 "Persist every agent input/output for
+    audit"."""
 
     run: RunRecord
     validation_report: ValidationReport
     reconciliation_report: ReconciliationReport
     verifier_result: VerifierResult
     release_decision: ReleaseDecision
+    confidence_report: ConfidenceReport
 
     model_config = {"arbitrary_types_allowed": True}
 
@@ -98,6 +101,7 @@ class WorkflowOrchestrator:
         rule_executor: ValidationRuleExecutor | None = None,
         reconciliation_agent: ReconciliationAgent | None = None,
         drift_monitor: SchemaDriftMonitor | None = None,
+        confidence_scorer: ConfidenceScorer | None = None,
     ) -> None:
         self._registry = registry
         self._run_store = run_store
@@ -111,6 +115,7 @@ class WorkflowOrchestrator:
         self._rule_executor = rule_executor or ValidationRuleExecutor()
         self._reconciliation_agent = reconciliation_agent or ReconciliationAgent()
         self._drift_monitor = drift_monitor or SchemaDriftMonitor()
+        self._confidence_scorer = confidence_scorer or ConfidenceScorer()
 
     def check_drift(
         self,
@@ -486,6 +491,16 @@ class WorkflowOrchestrator:
             validation_report=validation_report,
             reconciliation_report=reconciliation_report,
         )
+        confidence_report = self._confidence_scorer.score(
+            contract=contract,
+            run=run,
+            workflow=workflow,
+            step_runs=step_runs,
+            validation_report=validation_report,
+            reconciliation_report=reconciliation_report,
+            verifier_result=verifier_result,
+            release_decision=release_decision,
+        )
 
         if run.state in _RELEASE_TERMINAL_STATES:
             return ReleaseResult(
@@ -494,6 +509,7 @@ class WorkflowOrchestrator:
                 reconciliation_report=reconciliation_report,
                 verifier_result=verifier_result,
                 release_decision=release_decision,
+                confidence_report=confidence_report,
             )
 
         new_state = RunState.RELEASED if release_decision.decision == "RELEASE" else RunState.QUARANTINED
@@ -505,6 +521,7 @@ class WorkflowOrchestrator:
             reconciliation_report=reconciliation_report,
             verifier_result=verifier_result,
             release_decision=release_decision,
+            confidence_report=confidence_report,
         )
 
     def explain(
