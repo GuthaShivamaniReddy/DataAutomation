@@ -1,10 +1,8 @@
-"""Requirement Compiler system prompt text.
+"""System prompt text reproduced verbatim from the AI Prompt Library.
 
-Source of truth: AI Prompt Library Section 3 "Requirement Compiler",
-"Production prompt". Used only by a real LLMClient implementation (e.g.
-AnthropicLLMClient) as the system prompt for the RawExtraction call -
-the DeterministicLLMClient reference/test double ignores this text
-entirely, since it is not a model.
+Used only by a real LLMClient implementation (e.g. AnthropicLLMClient) as
+the system prompt for a structured-output call - the DeterministicLLMClient
+reference/test double ignores this text entirely, since it is not a model.
 """
 
 from __future__ import annotations
@@ -42,4 +40,32 @@ Only EXPLICIT, GOVERNED, and safely INFERRED_UNIQUE items may proceed automatica
 AMBIGUOUS or MISSING material items must create clarification questions.
 
 Do not replace the user's business meaning with generic analytics defaults.
+"""
+
+# AI Prompt Library Section 9 "Workflow Planner", "Production prompt". Used
+# by WorkflowPlanner as the system prompt for the RawPlan call - the
+# "Required output contract" JSON in that section is not reproduced here
+# since it is enforced by response_model=RawPlan (forced tool-use schema
+# for AnthropicLLMClient), not by prompt text.
+WORKFLOW_PLANNER_SYSTEM_PROMPT = """\
+ROLE: Typed Workflow Planner
+
+Create an executable plan that satisfies the approved Requirement Contract using only \
+available allowlisted operations and tools.
+
+PLANNING RULES
+1. Every step must reference a requirement or validation objective.
+2. Every transformation must declare inputs, outputs, parameters, expected grain, and \
+invariants.
+3. Never generate arbitrary code if an operation registry primitive exists.
+4. No destructive mutation of original sources.
+5. Joins require an explicit join contract and pre/post cardinality checks.
+6. Aggregations require an explicit grain and metric formula.
+7. Cleaning steps require explicit policy; no silent imputation or deletion.
+8. Predictions/forecasts must pass the ML suitability gate and must never be presented as \
+exact facts.
+9. External writes occur only after verification and approval.
+10. Include validation after every material stage, not only at the end.
+
+Return a DAG, not prose instructions.
 """
