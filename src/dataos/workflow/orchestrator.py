@@ -25,13 +25,16 @@ from dataos.compiler.independent_verifier import IndependentVerifier, VerifierRe
 from dataos.compiler.policy_gate import PolicyDecision, PolicyGate
 from dataos.compiler.reconciliation_agent import ReconciliationAgent, ReconciliationReport
 from dataos.compiler.release_gate import ReleaseDecision, ReleaseGate
+from dataos.compiler.schema_drift_monitor import DriftReport, SchemaDriftMonitor
 from dataos.compiler.validation_rule_generator import CheckSpec, ValidationRuleGenerator
 from dataos.compiler.workflow_planner import PlannerOutput, WorkflowPlanner
 from dataos.contracts.requirement_contract import RequirementContract
 from dataos.errors import ErrorCode, PlatformError
+from dataos.ingestion.profiling import DatasetProfile, profile_dataset
 from dataos.ingestion.snapshot import DatasetVersion
 from dataos.registry.base import Operation
 from dataos.registry.registry import OperationRegistry
+from dataos.semantics.dictionary import SemanticDictionary
 from dataos.validation.engine import ValidationReport
 from dataos.validation.executor import ValidationRuleExecutor
 from dataos.workflow.artifact_store import ArtifactStore
@@ -94,6 +97,7 @@ class WorkflowOrchestrator:
         rule_generator: ValidationRuleGenerator | None = None,
         rule_executor: ValidationRuleExecutor | None = None,
         reconciliation_agent: ReconciliationAgent | None = None,
+        drift_monitor: SchemaDriftMonitor | None = None,
     ) -> None:
         self._registry = registry
         self._run_store = run_store
@@ -106,6 +110,36 @@ class WorkflowOrchestrator:
         self._rule_generator = rule_generator or ValidationRuleGenerator()
         self._rule_executor = rule_executor or ValidationRuleExecutor()
         self._reconciliation_agent = reconciliation_agent or ReconciliationAgent()
+        self._drift_monitor = drift_monitor or SchemaDriftMonitor()
+
+    def check_drift(
+        self,
+        *,
+        source_frames: dict[str, pl.DataFrame],
+        baseline_profiles: dict[str, DatasetProfile],
+        baseline_dictionary: SemanticDictionary | None = None,
+        current_dictionary: SemanticDictionary | None = None,
+    ) -> dict[str, DriftReport]:
+        """Schema and Semantic Drift Monitor (Section 25). Pure and
+        read-only: profiles each source with a supplied baseline fresh and
+        compares it, but does not raise or block anything itself - a
+        source with no baseline supplied is simply not checked (there is
+        nothing to compare against). `start_run` calls this internally and
+        does enforce the result when `baseline_profiles` is passed to it.
+        """
+        reports: dict[str, DriftReport] = {}
+        for name, baseline_profile in baseline_profiles.items():
+            frame = source_frames.get(name)
+            if frame is None:
+                continue
+            reports[name] = self._drift_monitor.compare(
+                source_name=name,
+                baseline_profile=baseline_profile,
+                current_profile=profile_dataset(frame),
+                baseline_dictionary=baseline_dictionary,
+                current_dictionary=current_dictionary,
+            )
+        return reports
 
     def generate_validation_checks(self, workflow: Workflow, contract: RequirementContract) -> list[CheckSpec]:
         """Validation Rule Generator (Section 19). Pure and read-only - it
@@ -190,6 +224,7 @@ class WorkflowOrchestrator:
         source_versions: dict[str, DatasetVersion],
         contract: RequirementContract | None = None,
         granted_approvals: frozenset[str] = frozenset(),
+        baseline_profiles: dict[str, DatasetProfile] | None = None,
     ) -> str:
         """Validate the DAG, create the run, lock source snapshot ids, and
         seed each declared source as an already-COMPLETED pseudo-step so a
@@ -204,6 +239,15 @@ class WorkflowOrchestrator:
         `start_run_from_contract`), so it is the only place the gate is
         enforced - a hand-built `Workflow` with an ungated `export` step
         cannot skip it by bypassing `start_run_from_contract`.
+
+        `baseline_profiles` is likewise optional: Blueprint 1.2 "No silent
+        automation drift" only applies once a baseline exists to compare
+        against - a source's first-ever run has none, and this codebase
+        has no baseline store yet, so a caller (e.g. a recurring
+        automation) that has kept its own baseline supplies it here to get
+        the check enforced; the same `SchemaDriftMonitor` is exposed
+        standalone via `check_drift()` for callers that only want the
+        report, not the block.
         """
         workflow.validate_dag()
 
@@ -215,6 +259,16 @@ class WorkflowOrchestrator:
                 "start_run requires a frame and a DatasetVersion for every declared source",
                 evidence={"missing_frames": missing_frames, "missing_versions": missing_versions},
             )
+
+        if baseline_profiles:
+            drift_reports = self.check_drift(source_frames=source_frames, baseline_profiles=baseline_profiles)
+            blocked = {name: r for name, r in drift_reports.items() if r.automation_action != "CONTINUE"}
+            if blocked:
+                raise PlatformError(
+                    ErrorCode.SCHEMA_DRIFT,
+                    "one or more sources drifted from their approved baseline",
+                    evidence={name: report.model_dump() for name, report in blocked.items()},
+                )
 
         policy_decision = self._policy_gate.evaluate(
             workflow=workflow, contract=contract, granted_approvals=granted_approvals

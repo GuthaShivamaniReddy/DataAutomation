@@ -11,6 +11,7 @@ from dataos.contracts.requirement_contract import (
     Source,
 )
 from dataos.errors import ErrorCode, PlatformError
+from dataos.ingestion.profiling import profile_dataset
 from dataos.ingestion.snapshot import ingest_file
 from dataos.llm.deterministic import DeterministicLLMClient
 from dataos.registry.operations.aggregate import AggregateOperation
@@ -651,3 +652,75 @@ def test_release_quarantines_when_a_generated_null_policy_check_fails(fixtures_d
     assert result.release_decision.decision == "QUARANTINE"
     assert any("blocking validation" in r for r in result.release_decision.reason_codes)
     assert "null_rate:net_amount" in result.release_decision.required_remediation
+
+
+def _select_filter_workflow() -> Workflow:
+    return Workflow(
+        workflow_version=1,
+        requirement_contract_id="rc_drift_test",
+        sources=["orders"],
+        steps=[WorkflowStep(id="s1", operation_id="select_filter", operation_version="1.0", inputs=["source:orders"])],
+    )
+
+
+def test_start_run_blocks_on_breaking_schema_drift(fixtures_dir, tmp_path):
+    baseline_df = pl.read_csv(fixtures_dir / "orders_basic.csv")
+    baseline_profile = profile_dataset(baseline_df)
+
+    drifted_df = baseline_df.drop("region")  # a required column vanished
+    version = ingest_file(fixtures_dir / "orders_basic.csv", storage_root=tmp_path / "dataos_store")
+
+    registry = OperationRegistry()
+    registry.register(SelectFilterOperation())
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    with pytest.raises(PlatformError) as excinfo:
+        orchestrator.start_run(
+            _select_filter_workflow(),
+            source_frames={"orders": drifted_df},
+            source_versions={"orders": version},
+            baseline_profiles={"orders": baseline_profile},
+        )
+
+    assert excinfo.value.code == ErrorCode.SCHEMA_DRIFT
+    assert excinfo.value.evidence["orders"]["drift_status"] == "BREAKING"
+
+
+def test_start_run_proceeds_when_no_drift(fixtures_dir, tmp_path):
+    df = pl.read_csv(fixtures_dir / "orders_basic.csv")
+    baseline_profile = profile_dataset(df)
+    version = ingest_file(fixtures_dir / "orders_basic.csv", storage_root=tmp_path / "dataos_store")
+
+    registry = OperationRegistry()
+    registry.register(SelectFilterOperation())
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    run_id = orchestrator.start_run(
+        _select_filter_workflow(),
+        source_frames={"orders": df},
+        source_versions={"orders": version},
+        baseline_profiles={"orders": baseline_profile},
+    )
+    assert run_id  # did not raise
+
+
+def test_start_run_skips_drift_check_when_no_baseline_supplied(fixtures_dir, tmp_path):
+    baseline_df = pl.read_csv(fixtures_dir / "orders_basic.csv")
+    drifted_df = baseline_df.drop("region")
+    version = ingest_file(fixtures_dir / "orders_basic.csv", storage_root=tmp_path / "dataos_store")
+
+    registry = OperationRegistry()
+    registry.register(SelectFilterOperation())
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    # No baseline_profiles passed - existing callers are unaffected by the drift monitor.
+    run_id = orchestrator.start_run(
+        _select_filter_workflow(), source_frames={"orders": drifted_df}, source_versions={"orders": version}
+    )
+    assert run_id
