@@ -20,6 +20,7 @@ import uuid
 import polars as pl
 from pydantic import BaseModel
 
+from dataos.compiler.automation_builder import AutomationSpec, AutomationWorkflowBuilder
 from dataos.compiler.confidence_scorer import ConfidenceReport, ConfidenceScorer
 from dataos.compiler.connector_planner import ConnectorWritePlanner, ExternalActionPlan, ExternalActionVerification
 from dataos.compiler.explanation_agent import Audience, ExplanationAgent, ExplanationOutput
@@ -108,6 +109,7 @@ class WorkflowOrchestrator:
         security_guard: SecurityGuard | None = None,
         pii_classifier: PIIClassifier | None = None,
         connector_planner: ConnectorWritePlanner | None = None,
+        automation_builder: AutomationWorkflowBuilder | None = None,
     ) -> None:
         self._registry = registry
         self._run_store = run_store
@@ -125,6 +127,7 @@ class WorkflowOrchestrator:
         self._security_guard = security_guard or SecurityGuard()
         self._pii_classifier = pii_classifier or PIIClassifier()
         self._connector_planner = connector_planner
+        self._automation_builder = automation_builder or AutomationWorkflowBuilder()
 
     def check_drift(
         self,
@@ -193,6 +196,34 @@ class WorkflowOrchestrator:
         plans = self._connector_planner.plan(workflow)
         step_runs = {s.step_id: s for s in self._run_store.list_step_runs(run_id)}
         return self._connector_planner.verify(plans, step_runs)
+
+    def build_automation(
+        self,
+        *,
+        automation_id: str,
+        workflow: Workflow,
+        trigger: dict,
+        notifications: list[str] | None = None,
+        retry_policy: str = "no automatic retry - a QUARANTINED run must be reviewed and re-triggered manually",
+        rollback_policy: str = "no compensating action defined for this automation's write-capable steps",
+        sla: str | None = None,
+    ) -> AutomationSpec:
+        """Automation Workflow Builder (Section 24). Pure and read-only -
+        version pins, preflight, and approval gates are read from the real
+        `workflow`; `trigger`/`notifications`/`retry_policy`/
+        `rollback_policy`/`sla` are always caller-supplied, never guessed.
+        Call this once, against a `Workflow` that has already reached
+        RELEASED, to get the `AutomationSpec` a scheduler should hold onto
+        and present to every future `start_automated_run()` call."""
+        return self._automation_builder.build(
+            automation_id=automation_id,
+            workflow=workflow,
+            trigger=trigger,
+            notifications=notifications,
+            retry_policy=retry_policy,
+            rollback_policy=rollback_policy,
+            sla=sla,
+        )
 
     def validate(self, run_id: str, workflow: Workflow, contract: RequirementContract) -> ValidationReport:
         """"Validation & Reconciliation" pipeline stage: generates the
@@ -368,6 +399,69 @@ class WorkflowOrchestrator:
             )
 
         return run_id
+
+    def start_automated_run(
+        self,
+        spec: AutomationSpec,
+        workflow: Workflow,
+        *,
+        source_frames: dict[str, pl.DataFrame],
+        source_versions: dict[str, DatasetVersion],
+        baseline_profiles: dict[str, DatasetProfile],
+        contract: RequirementContract | None = None,
+        granted_approvals: frozenset[str] = frozenset(),
+    ) -> str:
+        """The recurring-run entry point Section 24 exists for: "Never
+        auto-adapt to a material schema or semantic change. Drift must
+        stop or quarantine the run until reviewed."
+
+        Refuses outright - before anything else runs - if `workflow`'s own
+        `workflow_version`, `requirement_contract_id`, or any step's
+        `operation_version` no longer matches `spec.version_pins` exactly.
+        A changed pin is exactly the "material change" this automation was
+        built against; silently accepting a different workflow under the
+        same `AutomationSpec` is precisely the auto-adaptation Section 24
+        forbids - a human must rebuild the automation (call
+        `build_automation()` again) instead.
+
+        `baseline_profiles` is required here (unlike `start_run`'s own
+        optional parameter): a scheduled, unattended run is exactly the
+        case where schema-drift checking is not optional.
+        """
+        mismatches: list[str] = []
+        if workflow.workflow_version != spec.version_pins.workflow_version:
+            mismatches.append(
+                f"workflow_version changed: pinned {spec.version_pins.workflow_version}, "
+                f"got {workflow.workflow_version}"
+            )
+        if workflow.requirement_contract_id != spec.version_pins.requirement_contract_id:
+            mismatches.append(
+                f"requirement_contract_id changed: pinned '{spec.version_pins.requirement_contract_id}', "
+                f"got '{workflow.requirement_contract_id}'"
+            )
+        for step in workflow.steps:
+            pinned_version = spec.version_pins.operation_versions.get(step.operation_id)
+            if pinned_version is not None and pinned_version != step.operation_version:
+                mismatches.append(
+                    f"operation '{step.operation_id}' version changed: pinned {pinned_version}, "
+                    f"got {step.operation_version}"
+                )
+
+        if mismatches:
+            raise PlatformError(
+                ErrorCode.VALIDATION_FAIL,
+                "automated run refused: workflow no longer matches the approved automation's version pins",
+                evidence={"automation_id": spec.automation_id, "mismatches": mismatches},
+            )
+
+        return self.start_run(
+            workflow,
+            source_frames=source_frames,
+            source_versions=source_versions,
+            contract=contract,
+            granted_approvals=granted_approvals,
+            baseline_profiles=baseline_profiles,
+        )
 
     def start_run_from_contract(
         self,

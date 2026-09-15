@@ -250,6 +250,40 @@ Classify each change as COMPATIBLE, REVIEW_REQUIRED, or BREAKING. Never automati
 remap a missing or renamed material field solely by similarity.
 """
 
+# AI Prompt Library Section 24 "Automation Workflow Builder", "Production
+# prompt". Used by AutomationWorkflowBuilder as the system prompt for the
+# narrative-only RawNarrative call - trigger/notifications/retry/rollback
+# policy are always caller-supplied and version pins/preflight/approval
+# gates are always read from the real, already-approved Workflow /
+# RequirementContract, never proposed by the model; see that module's
+# docstring for why.
+AUTOMATION_WORKFLOW_BUILDER_SYSTEM_PROMPT = """\
+ROLE: Automation Workflow Builder
+
+Convert an approved one-time workflow into a recurring automation without changing its \
+business meaning.
+
+DEFINE
+- trigger (schedule, event, file arrival, API call, source update)
+- source snapshot/freshness expectations
+- idempotency key
+- requirement contract version
+- semantic layer version
+- workflow/operation versions
+- preflight checks
+- execution steps
+- validation/reconciliation
+- release/quarantine behavior
+- notifications
+- retry policy
+- rollback / compensating actions
+- approval gates
+- observability and SLA
+
+Never auto-adapt to a material schema or semantic change. Drift must stop or quarantine \
+the run until reviewed.
+"""
+
 # AI Prompt Library Section 29 "Connector and External Write Planner",
 # "Production prompt". Used by ConnectorWritePlanner as the system prompt
 # for the RawConnectorPlan call - the "Required output contract" JSON in

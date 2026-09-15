@@ -984,3 +984,101 @@ def test_plan_and_verify_external_actions_for_a_real_export_run(fixtures_dir, tm
     assert len(verifications) == 1
     assert verifications[0].verified is True
     assert verifications[0].issues == []
+
+
+def test_build_automation_reads_real_version_pins(tmp_path):
+    registry = OperationRegistry()
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    spec = orchestrator.build_automation(
+        automation_id="auto_orders_daily",
+        workflow=_select_filter_workflow(),
+        trigger={"type": "schedule", "cron": "0 6 * * *"},
+    )
+
+    assert spec.version_pins.workflow_version == 1
+    assert spec.version_pins.requirement_contract_id == "rc_drift_test"
+    assert spec.version_pins.operation_versions == {"select_filter": "1.0"}
+    assert spec.trigger == {"type": "schedule", "cron": "0 6 * * *"}
+
+
+def test_start_automated_run_proceeds_when_pins_match_and_no_drift(fixtures_dir, tmp_path):
+    df = pl.read_csv(fixtures_dir / "orders_basic.csv")
+    baseline_profile = profile_dataset(df)
+    version = ingest_file(fixtures_dir / "orders_basic.csv", storage_root=tmp_path / "dataos_store")
+
+    registry = OperationRegistry()
+    registry.register(SelectFilterOperation())
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    workflow = _select_filter_workflow()
+    spec = orchestrator.build_automation(automation_id="auto_1", workflow=workflow, trigger={})
+
+    run_id = orchestrator.start_automated_run(
+        spec,
+        workflow,
+        source_frames={"orders": df},
+        source_versions={"orders": version},
+        baseline_profiles={"orders": baseline_profile},
+    )
+    assert run_id
+
+
+def test_start_automated_run_refuses_when_workflow_version_changed(fixtures_dir, tmp_path):
+    df = pl.read_csv(fixtures_dir / "orders_basic.csv")
+    baseline_profile = profile_dataset(df)
+    version = ingest_file(fixtures_dir / "orders_basic.csv", storage_root=tmp_path / "dataos_store")
+
+    registry = OperationRegistry()
+    registry.register(SelectFilterOperation())
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    original_workflow = _select_filter_workflow()
+    spec = orchestrator.build_automation(automation_id="auto_1", workflow=original_workflow, trigger={})
+
+    changed_workflow = original_workflow.model_copy(update={"workflow_version": 2})
+
+    with pytest.raises(PlatformError) as excinfo:
+        orchestrator.start_automated_run(
+            spec,
+            changed_workflow,
+            source_frames={"orders": df},
+            source_versions={"orders": version},
+            baseline_profiles={"orders": baseline_profile},
+        )
+
+    assert excinfo.value.code == ErrorCode.VALIDATION_FAIL
+    assert any("workflow_version changed" in m for m in excinfo.value.evidence["mismatches"])
+
+
+def test_start_automated_run_still_enforces_schema_drift(fixtures_dir, tmp_path):
+    baseline_df = pl.read_csv(fixtures_dir / "orders_basic.csv")
+    baseline_profile = profile_dataset(baseline_df)
+    drifted_df = baseline_df.drop("region")
+    version = ingest_file(fixtures_dir / "orders_basic.csv", storage_root=tmp_path / "dataos_store")
+
+    registry = OperationRegistry()
+    registry.register(SelectFilterOperation())
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    workflow = _select_filter_workflow()
+    spec = orchestrator.build_automation(automation_id="auto_1", workflow=workflow, trigger={})
+
+    with pytest.raises(PlatformError) as excinfo:
+        orchestrator.start_automated_run(
+            spec,
+            workflow,
+            source_frames={"orders": drifted_df},
+            source_versions={"orders": version},
+            baseline_profiles={"orders": baseline_profile},
+        )
+
+    assert excinfo.value.code == ErrorCode.SCHEMA_DRIFT
