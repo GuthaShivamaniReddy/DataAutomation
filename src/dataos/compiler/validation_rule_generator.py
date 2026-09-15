@@ -47,8 +47,12 @@ OnFail = Literal["STOP", "QUARANTINE", "WARN"]
 class CheckSpec(BaseModel):
     check_id: str
     stage: str
-    """The workflow step id this check applies to, or a fixed stage name
-    ("contract", "release") for checks that are not tied to one step."""
+    """The artifact this check runs against: a workflow step id (its
+    output), a step's own input reference (e.g. "source:orders" - used
+    when a check needs pre-transform data a later step's output no longer
+    has, such as a sum reconciliation against a group-by step's input),
+    or a fixed stage name ("contract", "release") for checks not tied to
+    one step's data at all."""
     predicate: str
     """Human-readable statement of the assertion - never a vague claim."""
     check_function: str | None = None
@@ -109,15 +113,32 @@ class ValidationRuleGenerator:
             if not formula.startswith("sum("):
                 continue
             step = covering_step.get(metric.name)
-            column = _metric_column(step, metric.name) if step else None
+            if step is None:
+                # Nothing has actually computed this metric yet - there is
+                # no real column to reconcile against. IndependentVerifier's
+                # own requirement-coverage check already flags "no completed
+                # step covers this metric" as a defect; fabricating a check
+                # against a guessed column name here would be exactly the
+                # "guess when more than one interpretation is plausible"
+                # the Global Constitution forbids.
+                continue
+            column = _metric_column(step, metric.name)
+            if column is None:
+                continue  # the covering step doesn't expose a plain output column for this metric
+            if len(step.inputs) != 1:
+                continue  # ambiguous which input holds the pre-aggregation raw values
             tolerance = contract.tolerances.get(metric.name, _DEFAULT_RECONCILIATION_TOLERANCE)
             rules.append(
                 CheckSpec(
                     check_id=f"reconciliation:{metric.name}",
-                    stage=step.id if step else "contract",
-                    predicate=f"dual_computation(sum, {column or metric.name}) within {tolerance}",
+                    # `sum(column)` is a pre-aggregation value - a group-by
+                    # step's own OUTPUT no longer has the source column at
+                    # all, only the aggregated metric alias. This check
+                    # must run against the step's INPUT, not its output.
+                    stage=step.inputs[0],
+                    predicate=f"dual_computation(sum, {column}) within {tolerance}",
                     check_function="check_dual_computation",
-                    check_args={"column": column or metric.name, "agg": "sum", "tolerance": tolerance},
+                    check_args={"column": column, "agg": "sum", "tolerance": tolerance},
                     tolerance=tolerance,
                     severity="BLOCKING",
                     on_fail="QUARANTINE",

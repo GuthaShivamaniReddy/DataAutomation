@@ -31,6 +31,8 @@ from dataos.errors import ErrorCode, PlatformError
 from dataos.ingestion.snapshot import DatasetVersion
 from dataos.registry.base import Operation
 from dataos.registry.registry import OperationRegistry
+from dataos.validation.engine import ValidationReport
+from dataos.validation.executor import ValidationRuleExecutor
 from dataos.workflow.artifact_store import ArtifactStore
 from dataos.workflow.dsl import SOURCE_PREFIX, Workflow
 from dataos.workflow.state_machine import RunState
@@ -61,13 +63,16 @@ class PlannedRun(BaseModel):
 
 class ReleaseResult(BaseModel):
     """Result of `release()`: the (possibly newly RELEASED/QUARANTINED)
-    run, plus the Independent Verifier and Release Gate evidence behind
-    that decision - Prompt Library Section 38 "Persist every agent
-    input/output for audit"."""
+    run, plus the Validation, Independent Verifier, and Release Gate
+    evidence behind that decision - Prompt Library Section 38 "Persist
+    every agent input/output for audit"."""
 
     run: RunRecord
+    validation_report: ValidationReport
     verifier_result: VerifierResult
     release_decision: ReleaseDecision
+
+    model_config = {"arbitrary_types_allowed": True}
 
 
 _RELEASE_TERMINAL_STATES = frozenset({RunState.RELEASED, RunState.QUARANTINED, RunState.ROLLED_BACK})
@@ -85,6 +90,7 @@ class WorkflowOrchestrator:
         release_gate: ReleaseGate | None = None,
         explainer: ExplanationAgent | None = None,
         rule_generator: ValidationRuleGenerator | None = None,
+        rule_executor: ValidationRuleExecutor | None = None,
     ) -> None:
         self._registry = registry
         self._run_store = run_store
@@ -95,6 +101,7 @@ class WorkflowOrchestrator:
         self._release_gate = release_gate or ReleaseGate()
         self._explainer = explainer
         self._rule_generator = rule_generator or ValidationRuleGenerator()
+        self._rule_executor = rule_executor or ValidationRuleExecutor()
 
     def generate_validation_checks(self, workflow: Workflow, contract: RequirementContract) -> list[CheckSpec]:
         """Validation Rule Generator (Section 19). Pure and read-only - it
@@ -103,6 +110,52 @@ class WorkflowOrchestrator:
         `Workflow` exists (typically right after planning, before or
         alongside `run()`)."""
         return self._rule_generator.generate(contract=contract, workflow=workflow)
+
+    def validate(self, run_id: str, workflow: Workflow, contract: RequirementContract) -> ValidationReport:
+        """"Validation & Reconciliation" pipeline stage: generates the
+        check manifest (Section 19) and actually runs it against the real
+        artifacts this run produced.
+
+        A check's `stage` is directly loadable when it names a real step
+        id (that step's output) or a declared source ref like
+        "source:orders" (used for pre-transform checks - see
+        `ValidationRuleGenerator._reconciliation_checks`). A check
+        generated at the "contract" or "release" stage (contract-level
+        `null_policy`, `acceptance_tests`) has no single owning artifact,
+        so it runs against the workflow's terminal step's output instead:
+        the release candidate the check is really about. Every currently
+        buildable plan (`WorkflowPlanner`'s deterministic double, and every
+        hand-built test workflow) is a single linear chain, so "the last
+        step in execution order" and "the terminal step" coincide; a
+        genuinely branching DAG would need a real multi-sink design this
+        codebase does not have yet.
+        """
+        run = self._run_store.get_run(run_id)
+        if run is None:
+            raise PlatformError(ErrorCode.SCHEMA_MISSING, f"no run with id '{run_id}'")
+
+        rules = self._rule_generator.generate(contract=contract, workflow=workflow)
+
+        directly_loadable_refs = {s.id for s in workflow.steps} | {f"{SOURCE_PREFIX}{s}" for s in workflow.sources}
+        execution_order = workflow.execution_order()
+        terminal_step_id = execution_order[-1] if execution_order else None
+
+        dataframes: dict[str, pl.DataFrame] = {}
+        for rule in rules:
+            if rule.check_function is None or rule.stage in dataframes:
+                continue
+            source_step_id = rule.stage if rule.stage in directly_loadable_refs else terminal_step_id
+            if source_step_id is None:
+                continue
+            if source_step_id not in dataframes:
+                try:
+                    dataframes[source_step_id] = self._artifact_store.load_by_ids(run_id, source_step_id)
+                except PlatformError:
+                    continue
+            if rule.stage != source_step_id:
+                dataframes[rule.stage] = dataframes[source_step_id]
+
+        return self._rule_executor.execute(rules, dataframes)
 
     def start_run(
         self,
@@ -322,15 +375,15 @@ class WorkflowOrchestrator:
         return self._run_store.update_run_state(run_id, RunState.VERIFYING)
 
     def release(self, run_id: str, workflow: Workflow, contract: RequirementContract) -> ReleaseResult:
-        """Independent Verifier (Section 21) + Release/Quarantine Gate
-        (Section 23): Prompt Library "Agent pipeline" ordering is
-        "... -> Validation & Reconciliation -> Independent Verifier ->
-        Release / Quarantine Gate -> Explanation & Delivery". This is the
-        VERIFYING -> RELEASED/QUARANTINED transition `run()` deliberately
-        never makes itself - Blueprint 9.2 keeps verification and release
-        as a separate step from execution, and Section 23: "You are the
-        only component authorized to mark an analytical result as
-        released."
+        """Validation & Reconciliation (`validate()`) + Independent
+        Verifier (Section 21) + Release/Quarantine Gate (Section 23):
+        Prompt Library "Agent pipeline" ordering is "... -> Validation &
+        Reconciliation -> Independent Verifier -> Release / Quarantine
+        Gate -> Explanation & Delivery". This is the VERIFYING ->
+        RELEASED/QUARANTINED transition `run()` deliberately never makes
+        itself - Blueprint 9.2 keeps verification and release as a
+        separate step from execution, and Section 23: "You are the only
+        component authorized to mark an analytical result as released."
 
         Calling this again on an already-RELEASED/QUARANTINED/ROLLED_BACK
         run recomputes the same (pure, deterministic) verdict from the
@@ -342,17 +395,30 @@ class WorkflowOrchestrator:
         if run is None:
             raise PlatformError(ErrorCode.SCHEMA_MISSING, f"no run with id '{run_id}'")
 
+        validation_report = self.validate(run_id, workflow, contract)
         step_runs = self._run_store.list_step_runs(run_id)
         verifier_result = self._verifier.verify(contract=contract, workflow=workflow, run=run, step_runs=step_runs)
-        release_decision = self._release_gate.decide(contract=contract, run=run, verifier_result=verifier_result)
+        release_decision = self._release_gate.decide(
+            contract=contract, run=run, verifier_result=verifier_result, validation_report=validation_report
+        )
 
         if run.state in _RELEASE_TERMINAL_STATES:
-            return ReleaseResult(run=run, verifier_result=verifier_result, release_decision=release_decision)
+            return ReleaseResult(
+                run=run,
+                validation_report=validation_report,
+                verifier_result=verifier_result,
+                release_decision=release_decision,
+            )
 
         new_state = RunState.RELEASED if release_decision.decision == "RELEASE" else RunState.QUARANTINED
         run = self._run_store.update_run_state(run_id, new_state)
 
-        return ReleaseResult(run=run, verifier_result=verifier_result, release_decision=release_decision)
+        return ReleaseResult(
+            run=run,
+            validation_report=validation_report,
+            verifier_result=verifier_result,
+            release_decision=release_decision,
+        )
 
     def explain(
         self,

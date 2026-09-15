@@ -52,7 +52,9 @@ def test_sum_metric_generates_dual_computation_check_with_declared_tolerance():
     rules = ValidationRuleGenerator().generate(contract=contract, workflow=workflow)
 
     reconciliation = [r for r in rules if r.check_id == "reconciliation:revenue"][0]
-    assert reconciliation.stage == "s1"
+    # Runs against the step's INPUT, not its output - a group-by step's
+    # output no longer has the raw "net_amount" column to sum.
+    assert reconciliation.stage == "source:orders"
     assert reconciliation.check_function == "check_dual_computation"
     assert reconciliation.check_args == {"column": "net_amount", "agg": "sum", "tolerance": 5.0}
     assert reconciliation.tolerance == 5.0
@@ -61,11 +63,34 @@ def test_sum_metric_generates_dual_computation_check_with_declared_tolerance():
 
 def test_sum_metric_without_declared_tolerance_uses_default():
     contract = _contract(metrics=[Metric(name="revenue", formula="sum(orders.net_amount)")])
-    rules = ValidationRuleGenerator().generate(contract=contract, workflow=_workflow([]))
+    workflow = _workflow(
+        [
+            WorkflowStep(
+                id="s1",
+                operation_id="aggregate",
+                operation_version="1.0",
+                inputs=["source:orders"],
+                params={"metrics": [{"name": "revenue", "column": "net_amount", "fn": "sum"}]},
+                requirement_refs=["revenue"],
+            )
+        ]
+    )
+    rules = ValidationRuleGenerator().generate(contract=contract, workflow=workflow)
 
     reconciliation = [r for r in rules if r.check_id == "reconciliation:revenue"][0]
     assert reconciliation.tolerance == 0.01
-    assert reconciliation.stage == "contract"  # no covering step known
+    assert reconciliation.stage == "source:orders"
+
+
+def test_sum_metric_with_no_covering_step_generates_no_reconciliation_check():
+    # The metric was declared but never actually computed by any step -
+    # there is no real column to reconcile against, and fabricating one
+    # would be exactly the kind of guess the platform must never make.
+    # IndependentVerifier's own requirement-coverage check is what flags
+    # this case as a defect, not the Validation Rule Generator.
+    contract = _contract(metrics=[Metric(name="revenue", formula="sum(orders.net_amount)")])
+    rules = ValidationRuleGenerator().generate(contract=contract, workflow=_workflow([]))
+    assert rules == []
 
 
 def test_non_sum_metric_generates_no_reconciliation_check():

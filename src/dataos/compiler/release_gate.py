@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 
 from dataos.compiler.independent_verifier import VerifierResult
 from dataos.contracts.requirement_contract import RequirementContract, RequirementStatus
+from dataos.validation.engine import ValidationReport
 from dataos.workflow.state_machine import RunState
 from dataos.workflow.store import RunRecord
 
@@ -43,8 +44,10 @@ class ReleaseGate:
         contract: RequirementContract,
         run: RunRecord,
         verifier_result: VerifierResult,
+        validation_report: ValidationReport | None = None,
     ) -> ReleaseDecision:
         reason_codes: list[str] = []
+        required_remediation: list[str] = []
 
         # Section 23's own condition list, in order:
         if run.state != RunState.VERIFYING:
@@ -57,11 +60,17 @@ class ReleaseGate:
             reason_codes.append(f"independent verifier verdict is '{verifier_result.verdict}', not PASS")
         if verifier_result.release_recommendation != "RELEASE":
             reason_codes.append("independent verifier does not recommend RELEASE")
+        if validation_report is not None and not validation_report.passed:
+            reason_codes.append("one or more blocking validation checks failed")
+            required_remediation.extend(f.check_id for f in validation_report.blocking_failures)
 
         # Never downgrade a blocking failure to a warning: any reason code
         # forces QUARANTINE outright, regardless of how many others agree.
         decision: Literal["RELEASE", "QUARANTINE"] = "QUARANTINE" if reason_codes else "RELEASE"
-        required_remediation = list(verifier_result.defects) if decision == "QUARANTINE" else []
+        if decision == "QUARANTINE":
+            required_remediation = list(verifier_result.defects) + required_remediation
+        else:
+            required_remediation = []
 
         return ReleaseDecision(
             decision=decision,

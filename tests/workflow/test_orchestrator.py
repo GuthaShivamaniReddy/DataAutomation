@@ -561,7 +561,85 @@ def test_generate_validation_checks_for_a_planned_sum_metric_workflow(tmp_path):
     assert len(checks) == 1
     check = checks[0]
     assert check.check_id == "reconciliation:total_amount"
-    assert check.stage == "s1"
+    assert check.stage == "source:orders"  # pre-aggregation input, not the group-by step's own output
     assert check.check_function == "check_dual_computation"
     assert check.check_args == {"column": "net_amount", "agg": "sum", "tolerance": 2.5}
     assert check.tolerance == 2.5
+
+
+def test_release_runs_the_generated_reconciliation_check_and_releases_on_pass(fixtures_dir, tmp_path):
+    df = pl.read_csv(fixtures_dir / "orders_basic.csv")
+    version = ingest_file(fixtures_dir / "orders_basic.csv", storage_root=tmp_path / "dataos_store")
+
+    registry = OperationRegistry()
+    registry.register(AggregateOperation())
+
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    planner = WorkflowPlanner(DeterministicLLMClient(), registry)
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store, planner)
+
+    contract = RequirementContract(
+        objective="show total net amount",
+        sources=[Source(name="orders")],
+        metrics=[
+            Metric(name="total_amount", formula="sum(orders.net_amount)", definition_status=DefinitionStatus.GOVERNED)
+        ],
+        status=RequirementStatus.APPROVED,
+    )
+
+    planned = orchestrator.start_run_from_contract(
+        contract=contract,
+        contract_id="rc_reconciliation_test",
+        source_frames={"orders": df},
+        source_versions={"orders": version},
+    )
+    orchestrator.run(planned.run_id, planned.planner_output.workflow)
+
+    result = orchestrator.release(planned.run_id, planned.planner_output.workflow, contract)
+
+    assert result.run.state == RunState.RELEASED
+    reconciliation_result = next(r for r in result.validation_report.results if r.check_id == "reconciliation:total_amount")
+    assert reconciliation_result.passed is True
+    assert reconciliation_result.observed == 825.85  # sum(net_amount) in orders_basic.csv
+
+
+def test_release_quarantines_when_a_generated_null_policy_check_fails(fixtures_dir, tmp_path):
+    # orders_nulls.csv has a null net_amount - a contract declaring
+    # null_policy="error" for it must actually block release, not just
+    # exist as an unexecuted manifest entry.
+    df = pl.read_csv(fixtures_dir / "orders_nulls.csv")
+    version = ingest_file(fixtures_dir / "orders_nulls.csv", storage_root=tmp_path / "dataos_store")
+
+    registry = OperationRegistry()
+    registry.register(SelectFilterOperation())
+
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    contract = RequirementContract(
+        objective="show orders",
+        sources=[Source(name="orders")],
+        null_policy={"net_amount": "error"},
+        status=RequirementStatus.APPROVED,
+    )
+    workflow = Workflow(
+        workflow_version=1,
+        requirement_contract_id="rc_null_check_test",
+        sources=["orders"],
+        steps=[WorkflowStep(id="s1", operation_id="select_filter", operation_version="1.0", inputs=["source:orders"])],
+    )
+
+    run_id = orchestrator.start_run(workflow, source_frames={"orders": df}, source_versions={"orders": version})
+    orchestrator.run(run_id, workflow)
+
+    result = orchestrator.release(run_id, workflow, contract)
+
+    assert result.validation_report.passed is False
+    null_check = next(r for r in result.validation_report.results if r.check_id == "null_rate:net_amount")
+    assert null_check.passed is False
+    assert result.run.state == RunState.QUARANTINED
+    assert result.release_decision.decision == "QUARANTINE"
+    assert any("blocking validation" in r for r in result.release_decision.reason_codes)
+    assert "null_rate:net_amount" in result.release_decision.required_remediation
