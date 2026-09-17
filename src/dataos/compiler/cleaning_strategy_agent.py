@@ -118,6 +118,8 @@ class CleaningStrategyAgent:
                     self._handle_completeness_issue(issue, contract, blocking_items)
                 elif issue.rule.startswith("duplicates:"):
                     rules.append(self._rule_from_duplicates_issue(issue))
+                elif issue.rule.startswith("text_formatting:"):
+                    rules.append(self._rule_from_text_formatting_issue(issue))
                 elif issue.rule.startswith(_CONTRACT_LEVEL_ISSUE_PREFIXES):
                     blocking_items.append(
                         CleaningBlockingItem(
@@ -209,5 +211,24 @@ class CleaningStrategyAgent:
             lossy=True,
             expected_impact=issue.observed,
             validation="post-dedup row_count must reconcile against the pre-dedup row_count minus the removed duplicate count",
+            approval_required=True,
+        )
+
+    def _rule_from_text_formatting_issue(self, issue: QualityIssue) -> CleaningRule:
+        ref = issue.rule.split(":", 1)[1]  # "<dataset>.<column>"
+        _, _, column = ref.partition(".")
+        return CleaningRule(
+            rule_id=f"text_clean:{ref}",
+            condition=f"case/whitespace-only variants in '{ref}' - observed {issue.observed}",
+            action=(
+                f"normalize '{column}' via the registered 'text_clean' operation "
+                "(normalize: trim, lower) with allow_identity_collapse=True"
+            ),
+            lossy=True,
+            expected_impact=issue.observed,
+            validation=(
+                f"post-clean distinct_count for '{column}' must equal the pre-clean trimmed_lowercase_distinct_count "
+                "reported by profiling; re-profile to confirm no further variants remain"
+            ),
             approval_required=True,
         )

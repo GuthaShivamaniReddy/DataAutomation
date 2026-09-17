@@ -142,6 +142,29 @@ def test_time_range_declared_with_a_date_column_has_no_issue():
     assert not any(i.rule == "time_coverage" for i in result.issues)
 
 
+def test_case_and_whitespace_inconsistency_on_a_mapped_column_requires_a_rule():
+    orders = pl.DataFrame({"order_id": [1, 2, 3], "region": ["East", "east ", "West"]})
+    profiles = {"orders": profile_dataset(orders)}
+    contract = _contract(dimensions=["region"])
+    schema_mapping = SchemaMappingAgent().map(contract=contract, profiles=profiles)
+
+    result = DataQualityAssessor().assess(contract=contract, profiles=profiles, schema_mapping=schema_mapping)
+
+    assert result.fitness == "CONDITIONAL"
+    assert any(i.rule == "text_formatting:orders.region" for i in result.issues)
+
+
+def test_clean_text_on_a_mapped_column_has_no_text_formatting_issue():
+    orders = pl.DataFrame({"order_id": [1, 2], "region": ["East", "West"]})
+    profiles = {"orders": profile_dataset(orders)}
+    contract = _contract(dimensions=["region"])
+    schema_mapping = SchemaMappingAgent().map(contract=contract, profiles=profiles)
+
+    result = DataQualityAssessor().assess(contract=contract, profiles=profiles, schema_mapping=schema_mapping)
+
+    assert not any(i.rule.startswith("text_formatting:") for i in result.issues)
+
+
 def test_narrative_is_none_without_an_llm_client():
     orders = pl.DataFrame({"order_id": [1]})
     profiles = {"orders": profile_dataset(orders)}

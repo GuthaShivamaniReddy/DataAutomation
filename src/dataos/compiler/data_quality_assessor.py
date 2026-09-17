@@ -100,6 +100,7 @@ class DataQualityAssessor:
             *self._cross_source_dtype_issues(profiles),
             *self._currency_policy_issues(contract, schema_mapping),
             *self._time_coverage_issues(contract, profiles),
+            *self._text_formatting_issues(schema_mapping, profiles),
         ]
 
         fitness = self._fitness(issues)
@@ -149,6 +150,39 @@ class DataQualityAssessor:
                         if blocking
                         else "define an explicit null-handling rule (Cleaning Strategy Agent) before this field is used"
                     ),
+                )
+            )
+        return issues
+
+    def _text_formatting_issues(
+        self, schema_mapping: SchemaMappingResult | None, profiles: dict[str, DatasetProfile]
+    ) -> list[QualityIssue]:
+        if schema_mapping is None:
+            return []
+        issues: list[QualityIssue] = []
+        for mapping in schema_mapping.mappings:
+            if mapping.status != "MAPPED" or not mapping.dataset or not mapping.column:
+                continue
+            profile = profiles.get(mapping.dataset)
+            if profile is None:
+                continue
+            col = profile.column(mapping.column)
+            if col is None or col.trimmed_lowercase_distinct_count is None:
+                continue
+            if col.trimmed_lowercase_distinct_count >= col.distinct_count:
+                continue
+
+            collapsed = col.distinct_count - col.trimmed_lowercase_distinct_count
+            issues.append(
+                QualityIssue(
+                    severity="REQUIRES_RULE",
+                    rule=f"text_formatting:{mapping.dataset}.{mapping.column}",
+                    observed=(
+                        f"{col.distinct_count} distinct value(s) fold to {col.trimmed_lowercase_distinct_count} "
+                        f"after trim+lowercase ({collapsed} case/whitespace-only variant(s))"
+                    ),
+                    impact=f"'{mapping.concept}' may double-count or mis-group rows that only differ by case/whitespace in '{mapping.dataset}.{mapping.column}'",
+                    required_action="define an explicit text-normalization rule (Cleaning Strategy Agent) before this field is used for grouping/joining",
                 )
             )
         return issues

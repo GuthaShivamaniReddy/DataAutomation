@@ -99,6 +99,21 @@ def test_duplicate_rows_issue_produces_a_lossy_approval_required_dedup_rule():
     assert rule.approval_required is True
 
 
+def test_text_formatting_issue_produces_a_lossy_approval_required_text_clean_rule():
+    orders = pl.DataFrame({"order_id": [1, 2, 3], "region": ["East", "east ", "West"]})
+    profiles = {"orders": profile_dataset(orders)}
+    contract = _contract(dimensions=["region"])
+    schema_mapping = SchemaMappingAgent().map(contract=contract, profiles=profiles)
+    quality_report = DataQualityAssessor().assess(contract=contract, profiles=profiles, schema_mapping=schema_mapping)
+
+    result = CleaningStrategyAgent().propose(contract=contract, quality_report=quality_report)
+
+    rule = next(r for r in result.rules if r.rule_id == "text_clean:orders.region")
+    assert rule.lossy is True
+    assert rule.approval_required is True
+    assert "allow_identity_collapse=True" in rule.action
+
+
 def test_currency_policy_issue_is_never_resolved_by_a_guessed_rule():
     orders = pl.DataFrame({"order_id": [1], "net_amount": [100.0]})
     profiles = {"orders": profile_dataset(orders)}

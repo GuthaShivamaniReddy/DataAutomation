@@ -28,6 +28,14 @@ class ColumnProfile(BaseModel):
     is_candidate_key: bool
     min_value: str | None = None
     max_value: str | None = None
+    trimmed_lowercase_distinct_count: int | None = None
+    """String columns only: what `distinct_count` would be after
+    trim + lowercase normalization. Strictly less than `distinct_count`
+    is a provable signal of case/whitespace-only inconsistency (e.g.
+    "Bob" / "bob " / "BOB") - the Data Quality Assessor's text-
+    formatting check reads this directly rather than re-deriving it,
+    so profiling stays the single place "OBSERVED facts" are computed
+    (see module docstring)."""
 
 
 class DatasetProfile(BaseModel):
@@ -69,6 +77,14 @@ def profile_dataset(df: pl.DataFrame) -> DatasetProfile:
             min_value = str(mn) if mn is not None else None
             max_value = str(mx) if mx is not None else None
 
+        trimmed_lowercase_distinct_count = None
+        if series.dtype == pl.Utf8 and null_count < row_count:
+            # No drop_nulls(): a null stays null through strip_chars/to_lowercase
+            # and is still counted as exactly one category by n_unique(), the
+            # same way `distinct_count` above counts it - keeping the two
+            # counts comparable instead of one silently excluding nulls.
+            trimmed_lowercase_distinct_count = int(series.str.strip_chars().str.to_lowercase().n_unique())
+
         columns.append(
             ColumnProfile(
                 name=name,
@@ -79,6 +95,7 @@ def profile_dataset(df: pl.DataFrame) -> DatasetProfile:
                 is_candidate_key=is_candidate_key,
                 min_value=min_value,
                 max_value=max_value,
+                trimmed_lowercase_distinct_count=trimmed_lowercase_distinct_count,
             )
         )
         if is_candidate_key:
