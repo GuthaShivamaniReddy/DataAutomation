@@ -15,28 +15,30 @@ agents are constrained to select from.
 from __future__ import annotations
 
 from dataos.errors import ErrorCode, PlatformError
-from dataos.registry.base import Operation
+from dataos.registry.base import BinaryOperation, Operation
 from dataos.registry.operations import (
     AggregateOperation,
     CastOperation,
     DeduplicateOperation,
     DeriveOperation,
     ExportOperation,
+    JoinOperation,
     SelectFilterOperation,
+    ValidateSchemaOperation,
 )
 
 
 class OperationRegistry:
     def __init__(self) -> None:
-        self._operations: dict[str, Operation] = {}
+        self._operations: dict[str, Operation | BinaryOperation] = {}
 
-    def register(self, operation: Operation) -> None:
+    def register(self, operation: Operation | BinaryOperation) -> None:
         full_id = operation.full_id()
         if full_id in self._operations:
             raise ValueError(f"operation already registered: {full_id}")
         self._operations[full_id] = operation
 
-    def get(self, operation_id: str, version: str | None = None) -> Operation:
+    def get(self, operation_id: str, version: str | None = None) -> Operation | BinaryOperation:
         """Resolve an operation by id (+ optional version).
 
         Raises PlatformError(NO_SAFE_OPERATION) rather than KeyError so
@@ -77,6 +79,8 @@ def _build_default_registry() -> OperationRegistry:
         DeriveOperation,
         AggregateOperation,
         ExportOperation,
+        JoinOperation,
+        ValidateSchemaOperation,
     ):
         registry.register(op_cls())
     return registry

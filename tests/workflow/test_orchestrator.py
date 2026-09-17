@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import polars as pl
 import pytest
 
@@ -24,6 +26,7 @@ from dataos.llm.deterministic import DeterministicLLMClient
 from dataos.registry.operations.aggregate import AggregateOperation
 from dataos.registry.operations.deduplicate import DeduplicateOperation
 from dataos.registry.operations.export import ExportOperation
+from dataos.registry.operations.join import JoinOperation
 from dataos.registry.operations.select_filter import SelectFilterOperation
 from dataos.registry.registry import OperationRegistry
 from dataos.workflow.artifact_store import ArtifactStore
@@ -1053,6 +1056,85 @@ def test_review_joins_without_key_evidence_raises(tmp_path):
         orchestrator.review_joins(_join_workflow(), profiles, key_evidence_by_step={})
 
     assert excinfo.value.code == ErrorCode.SCHEMA_MISSING
+
+
+def test_run_actually_executes_a_join_step(tmp_path, tmp_storage_root):
+    orders = pl.DataFrame({"order_id": [1, 2, 3], "customer_id": [10, 10, 20]})
+    customers = pl.DataFrame({"customer_id": [10, 20], "name": ["Alice", "Bob"]})
+
+    registry = OperationRegistry()
+    registry.register(JoinOperation())
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    workflow = _join_workflow()
+    orders_version = ingest_file(_write_csv(tmp_storage_root, "orders.csv", orders), storage_root=tmp_storage_root)
+    customers_version = ingest_file(
+        _write_csv(tmp_storage_root, "customers.csv", customers), storage_root=tmp_storage_root
+    )
+
+    run_id = orchestrator.start_run(
+        workflow,
+        source_frames={"orders": orders, "customers": customers},
+        source_versions={"orders": orders_version, "customers": customers_version},
+    )
+    run = orchestrator.run(run_id, workflow)
+
+    assert run.state == RunState.VERIFYING
+    step = run_store.get_step_run(run_id, "j1")
+    assert step is not None
+    assert step.status == "COMPLETED"
+    assert step.evidence["matched_row_count"] == 3
+    assert step.evidence["row_multiplication_factor"] == 1.0
+
+    joined = artifact_store.load_by_ids(run_id, "j1")
+    assert joined.height == 3
+    assert "name" in joined.columns
+
+
+def test_run_rejects_a_join_step_with_the_wrong_number_of_inputs(tmp_path):
+    registry = OperationRegistry()
+    registry.register(JoinOperation())
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    orders = pl.DataFrame({"order_id": [1], "customer_id": [10]})
+    workflow = Workflow(
+        workflow_version=1,
+        requirement_contract_id="rc_bad_join",
+        sources=["orders"],
+        steps=[
+            WorkflowStep(
+                id="j1",
+                operation_id="join",
+                operation_version="1.0",
+                inputs=["source:orders"],  # only one input for a binary operation
+                params={
+                    "left_keys": ["customer_id"],
+                    "right_keys": ["customer_id"],
+                    "expected_cardinality": "many_to_one",
+                },
+            )
+        ],
+    )
+    version = ingest_file(_write_csv(tmp_path, "orders.csv", orders), storage_root=tmp_path / "raw")
+
+    run_id = orchestrator.start_run(workflow, source_frames={"orders": orders}, source_versions={"orders": version})
+    run = orchestrator.run(run_id, workflow)
+
+    assert run.state == RunState.QUARANTINED
+    step = run_store.get_step_run(run_id, "j1")
+    assert step is not None
+    assert step.status == "FAILED"
+
+
+def _write_csv(root, name: str, df: pl.DataFrame):
+    path = Path(root) / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.write_csv(path)
+    return path
 
 
 def test_map_schema_maps_a_governed_metric_to_its_source_field(tmp_path):

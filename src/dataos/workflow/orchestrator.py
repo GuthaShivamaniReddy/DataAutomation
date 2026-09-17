@@ -46,7 +46,7 @@ from dataos.contracts.requirement_contract import RequirementContract
 from dataos.errors import ErrorCode, PlatformError
 from dataos.ingestion.profiling import DatasetProfile, profile_dataset
 from dataos.ingestion.snapshot import DatasetVersion
-from dataos.registry.base import Operation
+from dataos.registry.base import BinaryOperation, Operation
 from dataos.registry.registry import OperationRegistry
 from dataos.semantics.dictionary import SemanticDictionary
 from dataos.validation.engine import ValidationReport
@@ -218,10 +218,11 @@ class WorkflowOrchestrator:
         """Join Safety Reviewer (Section 12), run over every `join` step in
         a proposed workflow before any join actually executes. Pure and
         read-only, like `plan_external_actions`/`generate_validation_checks`:
-        it does not gate `start_run` itself, because `run()`'s executor
-        does not support multi-input steps at all yet (see its own
-        docstring) - there is no join execution for this to sit in front
-        of. It exists so a caller assembling or approving a plan that
+        it does not gate `start_run` itself - `run()`'s executor can run a
+        join (see its own docstring), but a proposed join contract should
+        still be reviewed and, where policy requires it, approved by a
+        human before the workflow is ever started, not merely caught after
+        the fact. It exists so a caller assembling or approving a plan that
         *proposes* a join can catch an unsafe one (bad keys, an
         undeclared or unapproved many-to-many, unproven uniqueness) before
         a human signs off on the workflow.
@@ -744,48 +745,61 @@ class WorkflowOrchestrator:
                 continue  # crash-safe resume: never re-execute a finished step
 
             step = workflow.step_by_id(step_id)
+            operation: Operation | BinaryOperation = self._registry.get(step.operation_id, step.operation_version)
+            is_binary = isinstance(operation, BinaryOperation)
+            expected_input_count = 2 if is_binary else 1
 
-            if len(step.inputs) != 1:
+            if len(step.inputs) != expected_input_count:
                 return self._fail_step_and_quarantine(
                     run_id,
                     step_id,
                     operation_full_id=step.full_operation_id,
                     reason=(
-                        f"step '{step_id}' declares {len(step.inputs)} input(s); only "
-                        "single-input operations are supported until a multi-input "
-                        "operation (e.g. join) is registered"
+                        f"step '{step_id}' declares {len(step.inputs)} input(s); "
+                        f"'{step.full_operation_id}' requires exactly {expected_input_count}"
                     ),
                 )
 
-            input_df = self._artifact_store.load_by_ids(run_id, step.inputs[0])
+            if is_binary:
+                # A join (the only BinaryOperation registered today) never
+                # writes to a file, so there is nothing for the Section 27
+                # Security Guard's export-destination check to run against
+                # here - that check only ever applies on the unary/export
+                # path below.
+                left_df = self._artifact_store.load_by_ids(run_id, step.inputs[0])
+                right_df = self._artifact_store.load_by_ids(run_id, step.inputs[1])
+            else:
+                input_df = self._artifact_store.load_by_ids(run_id, step.inputs[0])
 
-            if step.operation_id == "export":
-                # Section 27 Security Guard, defense in depth ahead of
-                # ExportOperation's own "'..'" precondition check: also
-                # rejects an unapproved destination scheme, and defuses
-                # CSV/Excel formula-injection payloads in the data itself
-                # before it is ever written to a file a user might open.
-                destination_path = step.params.get("destination_path", "") if isinstance(step.params, dict) else ""
-                path_report = self._security_guard.scan_destination_path(str(destination_path))
-                if path_report.decision == "BLOCK":
-                    return self._fail_step_and_quarantine(
-                        run_id,
-                        step_id,
-                        operation_full_id=step.full_operation_id,
-                        reason=f"export destination blocked by the security guard: {destination_path!r}",
-                        error_code=ErrorCode.POLICY_DENIED,
-                        evidence={"flags": [f.model_dump() for f in path_report.flags]},
-                    )
-                input_df = self._security_guard.defuse_formula_injection(input_df)
+                if step.operation_id == "export":
+                    # Section 27 Security Guard, defense in depth ahead of
+                    # ExportOperation's own "'..'" precondition check: also
+                    # rejects an unapproved destination scheme, and defuses
+                    # CSV/Excel formula-injection payloads in the data itself
+                    # before it is ever written to a file a user might open.
+                    destination_path = step.params.get("destination_path", "") if isinstance(step.params, dict) else ""
+                    path_report = self._security_guard.scan_destination_path(str(destination_path))
+                    if path_report.decision == "BLOCK":
+                        return self._fail_step_and_quarantine(
+                            run_id,
+                            step_id,
+                            operation_full_id=step.full_operation_id,
+                            reason=f"export destination blocked by the security guard: {destination_path!r}",
+                            error_code=ErrorCode.POLICY_DENIED,
+                            evidence={"flags": [f.model_dump() for f in path_report.flags]},
+                        )
+                    input_df = self._security_guard.defuse_formula_injection(input_df)
 
             started_at = now_iso()
             self._run_store.upsert_step_run(
                 StepRunRecord(run_id=run_id, step_id=step_id, status="RUNNING", started_at=started_at)
             )
 
-            operation: Operation = self._registry.get(step.operation_id, step.operation_version)
             try:
-                result = operation.execute(input_df, step.params)
+                if is_binary:
+                    result = operation.execute_join(left_df, right_df, step.params)
+                else:
+                    result = operation.execute(input_df, step.params)
             except PlatformError as exc:
                 self._run_store.upsert_step_run(
                     StepRunRecord(

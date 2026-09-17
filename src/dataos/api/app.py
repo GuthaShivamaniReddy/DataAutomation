@@ -44,6 +44,7 @@ from dataos.registry.operations.cast import CastOperation
 from dataos.registry.operations.deduplicate import DeduplicateOperation
 from dataos.registry.operations.derive import DeriveOperation
 from dataos.registry.operations.export import ExportOperation
+from dataos.registry.operations.join import JoinOperation
 from dataos.registry.operations.select_filter import SelectFilterOperation
 from dataos.registry.operations.validate_schema import ValidateSchemaOperation
 from dataos.registry.registry import OperationRegistry
@@ -58,11 +59,9 @@ _DEFAULT_STORE_ROOT = Path(os.environ.get("DATAOS_STORE_ROOT", ".dataos_store"))
 
 
 def _build_registry() -> OperationRegistry:
-    """Every single-input `Operation` this codebase has. `join` is a
-    `BinaryOperation` that `orchestrator.run()` cannot execute yet (see
-    its own docstring: only single-input steps are supported), so it is
-    deliberately left out - the planner must never be offered an
-    operation the executor cannot run."""
+    """Every deterministic operation this codebase has, including
+    `join` - `orchestrator.run()` now executes `BinaryOperation` steps
+    too (see its own docstring)."""
     registry = OperationRegistry()
     for op_cls in (
         SelectFilterOperation,
@@ -72,6 +71,7 @@ def _build_registry() -> OperationRegistry:
         AggregateOperation,
         ExportOperation,
         ValidateSchemaOperation,
+        JoinOperation,
     ):
         registry.register(op_cls())
     return registry
