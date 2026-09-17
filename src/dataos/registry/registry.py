@@ -23,7 +23,9 @@ from dataos.registry.operations import (
     DeriveOperation,
     ExportOperation,
     JoinOperation,
+    PivotOperation,
     SelectFilterOperation,
+    UnpivotOperation,
     ValidateSchemaOperation,
 )
 
@@ -81,6 +83,8 @@ def _build_default_registry() -> OperationRegistry:
         ExportOperation,
         JoinOperation,
         ValidateSchemaOperation,
+        PivotOperation,
+        UnpivotOperation,
     ):
         registry.register(op_cls())
     return registry

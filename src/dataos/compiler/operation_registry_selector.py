@@ -56,6 +56,8 @@ _STEP_TYPE_TO_OPERATION_ID: dict[str, str] = {
     "JOIN": "join",
     "VALIDATE": "validate_schema",
     "EXPORT": "export",
+    "PIVOT": "pivot",
+    "UNPIVOT": "unpivot",
 }
 
 # Ranking criterion 6 ("reversibility / idempotency") is the one bullet
@@ -71,6 +73,8 @@ _REVERSIBILITY_NOTES: dict[str, str] = {
     "join": "reversible on its inputs (neither source is mutated) but can amplify/duplicate rows - requires the Join Safety Reviewer's contract",
     "validate_schema": "read-only - never mutates data",
     "export": "terminal/irreversible side effect - requires policy approval before execution",
+    "pivot": "reversible via the paired 'unpivot' operation, except where an aggregate_function was required (that collapse is lossy and irreversible)",
+    "unpivot": "reversible via the paired 'pivot' operation - a pure reshape, no aggregation",
 }
 
 

@@ -18,7 +18,15 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-StepType = Literal["PROFILE", "FILTER", "JOIN", "DERIVE", "AGGREGATE", "VALIDATE", "MODEL", "EXPORT", "WRITE"]
+StepType = Literal[
+    "PROFILE", "FILTER", "CAST", "DEDUPLICATE", "JOIN", "DERIVE", "AGGREGATE", "PIVOT", "UNPIVOT",
+    "VALIDATE", "MODEL", "EXPORT", "WRITE",
+]
+"""Section 9's own enum (PROFILE/FILTER/JOIN/DERIVE/AGGREGATE/VALIDATE/
+MODEL/EXPORT/WRITE) plus CAST/DEDUPLICATE/PIVOT/UNPIVOT - additive step
+types for registered operations Section 9 predates. `type` stays
+informational only; a step's real behavior is fully determined by its
+`operation_id` (see module docstring)."""
 
 
 class RawPlanStep(BaseModel):

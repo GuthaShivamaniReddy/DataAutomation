@@ -1093,6 +1093,48 @@ def test_run_actually_executes_a_join_step(tmp_path, tmp_storage_root):
     assert "name" in joined.columns
 
 
+def test_run_actually_executes_a_pivot_step(tmp_path, tmp_storage_root):
+    from dataos.registry.operations.pivot import PivotOperation
+
+    scores = pl.DataFrame(
+        {
+            "student": ["Cady", "Cady", "Karen", "Karen"],
+            "subject": ["maths", "physics", "maths", "physics"],
+            "score": [98, 99, 61, 58],
+        }
+    )
+
+    registry = OperationRegistry()
+    registry.register(PivotOperation())
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    workflow = Workflow(
+        workflow_version=1,
+        requirement_contract_id="rc_pivot_test",
+        sources=["scores"],
+        steps=[
+            WorkflowStep(
+                id="p1",
+                operation_id="pivot",
+                operation_version="1.0",
+                inputs=["source:scores"],
+                params={"index": ["student"], "on": "subject", "values": "score"},
+            )
+        ],
+    )
+    version = ingest_file(_write_csv(tmp_storage_root, "scores.csv", scores), storage_root=tmp_storage_root)
+
+    run_id = orchestrator.start_run(workflow, source_frames={"scores": scores}, source_versions={"scores": version})
+    run = orchestrator.run(run_id, workflow)
+
+    assert run.state == RunState.VERIFYING
+    pivoted = artifact_store.load_by_ids(run_id, "p1")
+    assert pivoted.height == 2
+    assert set(pivoted.columns) == {"student", "maths", "physics"}
+
+
 def test_run_rejects_a_join_step_with_the_wrong_number_of_inputs(tmp_path):
     registry = OperationRegistry()
     registry.register(JoinOperation())
