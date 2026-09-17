@@ -47,6 +47,7 @@ from dataos.registry.operations.export import ExportOperation
 from dataos.registry.operations.join import JoinOperation
 from dataos.registry.operations.pivot import PivotOperation
 from dataos.registry.operations.select_filter import SelectFilterOperation
+from dataos.registry.operations.text_clean import TextCleanOperation
 from dataos.registry.operations.unpivot import UnpivotOperation
 from dataos.registry.operations.validate_schema import ValidateSchemaOperation
 from dataos.registry.registry import OperationRegistry
@@ -76,6 +77,7 @@ def _build_registry() -> OperationRegistry:
         JoinOperation,
         PivotOperation,
         UnpivotOperation,
+        TextCleanOperation,
     ):
         registry.register(op_cls())
     return registry

@@ -8,7 +8,7 @@ def test_default_registry_has_all_phase1_operations():
     ops = default_registry.list_operations()
     for expected in (
         "select_filter@1.0", "cast@1.0", "deduplicate@1.0", "derive@1.0", "aggregate@1.0", "export@1.0",
-        "validate_schema@1.0", "join@1.0", "pivot@1.0", "unpivot@1.0",
+        "validate_schema@1.0", "join@1.0", "pivot@1.0", "unpivot@1.0", "text_clean@1.0",
     ):
         assert expected in ops
 

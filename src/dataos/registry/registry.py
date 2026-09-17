@@ -25,6 +25,7 @@ from dataos.registry.operations import (
     JoinOperation,
     PivotOperation,
     SelectFilterOperation,
+    TextCleanOperation,
     UnpivotOperation,
     ValidateSchemaOperation,
 )
@@ -85,6 +86,7 @@ def _build_default_registry() -> OperationRegistry:
         ValidateSchemaOperation,
         PivotOperation,
         UnpivotOperation,
+        TextCleanOperation,
     ):
         registry.register(op_cls())
     return registry

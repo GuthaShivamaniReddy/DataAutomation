@@ -58,6 +58,7 @@ _STEP_TYPE_TO_OPERATION_ID: dict[str, str] = {
     "EXPORT": "export",
     "PIVOT": "pivot",
     "UNPIVOT": "unpivot",
+    "CLEAN_TEXT": "text_clean",
 }
 
 # Ranking criterion 6 ("reversibility / idempotency") is the one bullet
@@ -75,6 +76,7 @@ _REVERSIBILITY_NOTES: dict[str, str] = {
     "export": "terminal/irreversible side effect - requires policy approval before execution",
     "pivot": "reversible via the paired 'unpivot' operation, except where an aggregate_function was required (that collapse is lossy and irreversible)",
     "unpivot": "reversible via the paired 'pivot' operation - a pure reshape, no aggregation",
+    "text_clean": "reversible for regex_extract (adds a column); lossy for normalize/regex_replace - the operation itself blocks any normalize that would collapse distinct values unless explicitly allowed",
 }
 
 

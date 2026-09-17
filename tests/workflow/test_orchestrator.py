@@ -1135,6 +1135,43 @@ def test_run_actually_executes_a_pivot_step(tmp_path, tmp_storage_root):
     assert set(pivoted.columns) == {"student", "maths", "physics"}
 
 
+def test_run_actually_executes_a_text_clean_step(tmp_path, tmp_storage_root):
+    from dataos.registry.operations.text_clean import TextCleanOperation
+
+    customers = pl.DataFrame({"email": ["  Alice@Example.com ", "Bob@example.com"]})
+
+    registry = OperationRegistry()
+    registry.register(TextCleanOperation())
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    workflow = Workflow(
+        workflow_version=1,
+        requirement_contract_id="rc_text_clean_test",
+        sources=["customers"],
+        steps=[
+            WorkflowStep(
+                id="c1",
+                operation_id="text_clean",
+                operation_version="1.0",
+                inputs=["source:customers"],
+                params={"normalize": [{"column": "email", "steps": ["trim", "lower"]}]},
+            )
+        ],
+    )
+    version = ingest_file(_write_csv(tmp_storage_root, "customers.csv", customers), storage_root=tmp_storage_root)
+
+    run_id = orchestrator.start_run(
+        workflow, source_frames={"customers": customers}, source_versions={"customers": version}
+    )
+    run = orchestrator.run(run_id, workflow)
+
+    assert run.state == RunState.VERIFYING
+    cleaned = artifact_store.load_by_ids(run_id, "c1")
+    assert cleaned["email"].to_list() == ["alice@example.com", "bob@example.com"]
+
+
 def test_run_rejects_a_join_step_with_the_wrong_number_of_inputs(tmp_path):
     registry = OperationRegistry()
     registry.register(JoinOperation())
