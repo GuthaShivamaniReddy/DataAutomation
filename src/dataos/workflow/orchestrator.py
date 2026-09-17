@@ -27,6 +27,7 @@ from dataos.compiler.data_quality_assessor import DataQualityAssessor, DataQuali
 from dataos.compiler.explanation_agent import Audience, ExplanationAgent, ExplanationOutput
 from dataos.compiler.independent_verifier import IndependentVerifier, VerifierResult
 from dataos.compiler.join_safety_reviewer import JoinReviewResult, JoinSafetyReviewer
+from dataos.compiler.operation_registry_selector import OperationRegistrySelector, SelectorResult, StepRequest
 from dataos.compiler.pii_classifier import PIIClassifier
 from dataos.compiler.policy_gate import PolicyDecision, PolicyGate
 from dataos.compiler.reconciliation_agent import ReconciliationAgent, ReconciliationReport
@@ -116,6 +117,7 @@ class WorkflowOrchestrator:
         join_safety_reviewer: JoinSafetyReviewer | None = None,
         schema_mapping_agent: SchemaMappingAgent | None = None,
         data_quality_assessor: DataQualityAssessor | None = None,
+        operation_registry_selector: OperationRegistrySelector | None = None,
     ) -> None:
         self._registry = registry
         self._run_store = run_store
@@ -137,6 +139,7 @@ class WorkflowOrchestrator:
         self._join_safety_reviewer = join_safety_reviewer or JoinSafetyReviewer()
         self._schema_mapping_agent = schema_mapping_agent or SchemaMappingAgent()
         self._data_quality_assessor = data_quality_assessor or DataQualityAssessor()
+        self._operation_registry_selector = operation_registry_selector or OperationRegistrySelector(self._registry)
 
     def check_drift(
         self,
@@ -302,6 +305,21 @@ class WorkflowOrchestrator:
         being re-implemented here).
         """
         return self._data_quality_assessor.assess(contract=contract, profiles=profiles, schema_mapping=schema_mapping)
+
+    def select_operations(self, steps: list[StepRequest]) -> SelectorResult:
+        """Operation Registry Selector (Section 10). Pure and read-only,
+        like `map_schema`/`assess_data_quality`: resolves an abstract step
+        type (or an explicit operation_id override) against this
+        orchestrator's real `OperationRegistry` and reports the concrete
+        operation, its required params, and a certification/reversibility
+        reason - or NO_SAFE_OPERATION when nothing registered satisfies
+        it. `WorkflowPlanner`/`start_run_from_contract` still perform
+        their own registry resolution once a plan is fully concrete (see
+        their docstrings); this method exists for a caller that wants to
+        check step-type feasibility, with the full Section 10 reasoning,
+        before a plan is built at all.
+        """
+        return self._operation_registry_selector.select(steps)
 
     def verify_external_actions(self, run_id: str, workflow: Workflow) -> list[ExternalActionVerification]:
         """Independent post-write verification for every planned external

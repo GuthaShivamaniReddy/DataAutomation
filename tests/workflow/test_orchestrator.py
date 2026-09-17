@@ -5,6 +5,7 @@ from dataos.compiler.confidence_scorer import ConfidenceScorer
 from dataos.compiler.connector_planner import ConnectorWritePlanner
 from dataos.compiler.explanation_agent import ExplanationAgent
 from dataos.compiler.independent_verifier import IndependentVerifier
+from dataos.compiler.operation_registry_selector import StepRequest
 from dataos.compiler.reconciliation_agent import ReconciliationAgent
 from dataos.compiler.release_gate import ReleaseGate
 from dataos.compiler.workflow_planner import WorkflowPlanner
@@ -1073,6 +1074,31 @@ def test_assess_data_quality_uses_schema_mapping_for_completeness(tmp_path):
 
     assert result.fitness == "FAIL"
     assert any(i.rule == "completeness:orders.note" for i in result.issues)
+
+
+def test_select_operations_resolves_a_registered_step_type(tmp_path):
+    registry = OperationRegistry()
+    registry.register(SelectFilterOperation())
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    result = orchestrator.select_operations([StepRequest(step_id="s1", step_type="FILTER")])
+
+    assert result.unresolved == []
+    assert result.selections[0].operation_id == "select_filter"
+
+
+def test_select_operations_reports_no_safe_operation_for_an_unmapped_type(tmp_path):
+    registry = OperationRegistry()
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    result = orchestrator.select_operations([StepRequest(step_id="s1", step_type="MODEL")])
+
+    assert result.selections == []
+    assert result.unresolved[0].step_id == "s1"
 
 
 def test_map_schema_flags_an_unresolvable_source_field(tmp_path):

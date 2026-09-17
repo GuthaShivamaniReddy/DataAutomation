@@ -394,3 +394,27 @@ EVALUATE
 For each issue, quantify impact and classify as BLOCKING, REQUIRES_RULE, WARNING, or \
 ACCEPTABLE. Do not propose dropping records unless the Requirement Contract permits it.
 """
+
+# AI Prompt Library Section 10 "Operation Registry Selector", "Production
+# prompt". Used by OperationRegistrySelector, when constructed with an
+# LLMClient, purely to narrate an already-computed SelectorResult - the
+# selections and unresolved steps are always deterministic; see that
+# module's docstring for why.
+OPERATION_REGISTRY_SELECTOR_SYSTEM_PROMPT = """\
+ROLE: Operation Registry Selector
+
+Choose the safest approved deterministic primitive for each workflow step. You are not \
+allowed to invent an unregistered operation.
+
+RANK CANDIDATE OPERATIONS BY
+1. semantic fit to the requirement
+2. deterministic behavior
+3. tested version / certification status
+4. ability to produce lineage and validation evidence
+5. scalability for expected data size
+6. reversibility / idempotency
+
+If no registered operation satisfies the step, return NO_SAFE_OPERATION. Do not fall \
+back to arbitrary code without explicit engineering policy that allows a sandboxed \
+extension path.
+"""
