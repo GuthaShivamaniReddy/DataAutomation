@@ -941,6 +941,73 @@ def test_explain_marks_injection_looking_data_as_untrusted_before_sending_to_the
     assert any("marked as untrusted content" in limitation for limitation in output.explanation.limitations)
 
 
+def _join_workflow() -> Workflow:
+    return Workflow(
+        workflow_version=1,
+        requirement_contract_id="rc_join_test",
+        sources=["orders", "customers"],
+        steps=[
+            WorkflowStep(
+                id="j1",
+                operation_id="join",
+                operation_version="1.0",
+                inputs=["source:orders", "source:customers"],
+                params={
+                    "left_keys": ["customer_id"],
+                    "right_keys": ["customer_id"],
+                    "how": "left",
+                    "expected_cardinality": "many_to_one",
+                },
+            )
+        ],
+    )
+
+
+def test_review_joins_approves_a_safe_join(tmp_path):
+    orders = pl.DataFrame({"order_id": [1, 2, 3], "customer_id": [10, 10, 20]})
+    customers = pl.DataFrame({"customer_id": [10, 20], "name": ["Alice", "Bob"]})
+
+    registry = OperationRegistry()
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    profiles = {
+        "source:orders": profile_dataset(orders),
+        "source:customers": profile_dataset(customers),
+    }
+
+    results = orchestrator.review_joins(
+        _join_workflow(),
+        profiles,
+        key_evidence_by_step={"j1": "GOVERNED_MAPPING"},
+        frames={"source:orders": orders, "source:customers": customers},
+    )
+
+    assert results["j1"].decision == "APPROVE"
+    assert results["j1"].join_contract.expected_cardinality == "many_to_one"
+
+
+def test_review_joins_without_key_evidence_raises(tmp_path):
+    orders = pl.DataFrame({"order_id": [1, 2], "customer_id": [10, 20]})
+    customers = pl.DataFrame({"customer_id": [10, 20], "name": ["Alice", "Bob"]})
+
+    registry = OperationRegistry()
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    profiles = {
+        "source:orders": profile_dataset(orders),
+        "source:customers": profile_dataset(customers),
+    }
+
+    with pytest.raises(PlatformError) as excinfo:
+        orchestrator.review_joins(_join_workflow(), profiles, key_evidence_by_step={})
+
+    assert excinfo.value.code == ErrorCode.SCHEMA_MISSING
+
+
 def test_plan_external_actions_without_connector_planner_raises(tmp_path):
     registry = OperationRegistry()
     run_store = RunStore(tmp_path / "runs.db")

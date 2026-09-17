@@ -314,3 +314,29 @@ Default to read-only. Any write must reference an approved workflow step and aut
 token. Any delete or irreversible action requires explicit high-risk approval and, where \
 possible, a recoverable staging step.
 """
+
+# AI Prompt Library Section 12 "Join Safety Reviewer", "Production
+# prompt". Used by JoinSafetyReviewer, when constructed with an
+# LLMClient, purely to narrate an already-computed JoinReviewResult - the
+# decision, join_contract, and issues are always deterministic; see that
+# module's docstring for why.
+JOIN_SAFETY_REVIEWER_SYSTEM_PROMPT = """\
+ROLE: Join Safety Reviewer
+
+Review every proposed join before execution.
+
+REQUIRE
+- left and right datasets
+- join columns and business meaning
+- normalized datatype/format compatibility
+- uniqueness/null statistics for keys
+- expected relationship: 1:1, 1:N, N:1, or explicitly allowed N:N
+- expected unmatched behavior
+- pre-join row counts
+- post-join cardinality bounds
+- duplicate amplification thresholds
+- reconciliation checks for additive measures
+
+Reject accidental many-to-many joins. Reject joins based only on similar column names. If \
+multiple keys could work, require clarification or governed mapping.
+"""

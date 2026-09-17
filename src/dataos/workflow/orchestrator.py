@@ -25,6 +25,7 @@ from dataos.compiler.confidence_scorer import ConfidenceReport, ConfidenceScorer
 from dataos.compiler.connector_planner import ConnectorWritePlanner, ExternalActionPlan, ExternalActionVerification
 from dataos.compiler.explanation_agent import Audience, ExplanationAgent, ExplanationOutput
 from dataos.compiler.independent_verifier import IndependentVerifier, VerifierResult
+from dataos.compiler.join_safety_reviewer import JoinReviewResult, JoinSafetyReviewer
 from dataos.compiler.pii_classifier import PIIClassifier
 from dataos.compiler.policy_gate import PolicyDecision, PolicyGate
 from dataos.compiler.reconciliation_agent import ReconciliationAgent, ReconciliationReport
@@ -110,6 +111,7 @@ class WorkflowOrchestrator:
         pii_classifier: PIIClassifier | None = None,
         connector_planner: ConnectorWritePlanner | None = None,
         automation_builder: AutomationWorkflowBuilder | None = None,
+        join_safety_reviewer: JoinSafetyReviewer | None = None,
     ) -> None:
         self._registry = registry
         self._run_store = run_store
@@ -128,6 +130,7 @@ class WorkflowOrchestrator:
         self._pii_classifier = pii_classifier or PIIClassifier()
         self._connector_planner = connector_planner
         self._automation_builder = automation_builder or AutomationWorkflowBuilder()
+        self._join_safety_reviewer = join_safety_reviewer or JoinSafetyReviewer()
 
     def check_drift(
         self,
@@ -179,6 +182,79 @@ class WorkflowOrchestrator:
                 "orchestrator was constructed without a ConnectorWritePlanner; pass one to call plan_external_actions()",
             )
         return self._connector_planner.plan(workflow)
+
+    def review_joins(
+        self,
+        workflow: Workflow,
+        profiles: dict[str, DatasetProfile],
+        *,
+        key_evidence_by_step: dict[str, str],
+        frames: dict[str, pl.DataFrame] | None = None,
+    ) -> dict[str, JoinReviewResult]:
+        """Join Safety Reviewer (Section 12), run over every `join` step in
+        a proposed workflow before any join actually executes. Pure and
+        read-only, like `plan_external_actions`/`generate_validation_checks`:
+        it does not gate `start_run` itself, because `run()`'s executor
+        does not support multi-input steps at all yet (see its own
+        docstring) - there is no join execution for this to sit in front
+        of. It exists so a caller assembling or approving a plan that
+        *proposes* a join can catch an unsafe one (bad keys, an
+        undeclared or unapproved many-to-many, unproven uniqueness) before
+        a human signs off on the workflow.
+
+        `profiles` must have a `DatasetProfile` entry for every input ref
+        (`source:<name>` or another step's id) that a join step
+        references; a step whose inputs aren't both present is skipped
+        rather than guessed at. `key_evidence_by_step` requires the caller
+        to state, for every join step id, how its keys were chosen
+        (`"GOVERNED_MAPPING"` | `"EXPLICIT_USER_MAPPING"` | `"NAME_SIMILARITY_ONLY"`) -
+        deliberately no default, since nothing in `WorkflowStep` records
+        that provenance today and Section 12's "reject joins based only on
+        similar column names" is undecidable without it. A join step
+        missing from this dict fails loudly rather than being assumed
+        safe.
+
+        `frames`, if supplied, lets the reviewer also run real match-rate
+        and row-multiplication checks (identical math to
+        `JoinOperation.run_join`) instead of relying on profile evidence
+        alone.
+        """
+        results: dict[str, JoinReviewResult] = {}
+        frames = frames or {}
+        for step in workflow.steps:
+            if step.operation_id != "join":
+                continue
+            if len(step.inputs) != 2:
+                continue
+            left_ref, right_ref = step.inputs
+            left_profile = profiles.get(left_ref)
+            right_profile = profiles.get(right_ref)
+            if left_profile is None or right_profile is None:
+                continue
+            if step.id not in key_evidence_by_step:
+                raise PlatformError(
+                    ErrorCode.SCHEMA_MISSING,
+                    f"no key_evidence supplied for join step '{step.id}' - "
+                    "state how its join keys were chosen before it can be reviewed",
+                    evidence={"step_id": step.id},
+                )
+
+            params = step.params
+            results[step.id] = self._join_safety_reviewer.review(
+                left_name=left_ref,
+                right_name=right_ref,
+                left_keys=params.get("left_keys", []),
+                right_keys=params.get("right_keys", []),
+                how=params.get("how", "inner"),
+                key_evidence=key_evidence_by_step[step.id],
+                left_profile=left_profile,
+                right_profile=right_profile,
+                expected_cardinality=params.get("expected_cardinality"),
+                allow_many_to_many=params.get("allow_many_to_many", False),
+                left_frame=frames.get(left_ref),
+                right_frame=frames.get(right_ref),
+            )
+        return results
 
     def verify_external_actions(self, run_id: str, workflow: Workflow) -> list[ExternalActionVerification]:
         """Independent post-write verification for every planned external
