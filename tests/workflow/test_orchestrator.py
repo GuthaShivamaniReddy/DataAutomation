@@ -1141,6 +1141,32 @@ def test_propose_cleaning_rules_blocks_an_ungoverned_completeness_gap(tmp_path):
     assert any(b.field == "orders.customer_age" for b in result.blocking_items)
 
 
+def test_select_analytics_strategy_approves_a_descriptive_request(tmp_path):
+    registry = OperationRegistry()
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    contract = RequirementContract(objective="show total revenue", sources=[Source(name="orders")])
+    result = orchestrator.select_analytics_strategy(contract)
+
+    assert result.analysis_type == "DESCRIPTIVE"
+    assert result.status == "APPROVED"
+
+
+def test_select_analytics_strategy_rejects_a_forecasting_request(tmp_path):
+    registry = OperationRegistry()
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    contract = RequirementContract(objective="forecast next quarter revenue", sources=[Source(name="orders")])
+    result = orchestrator.select_analytics_strategy(contract)
+
+    assert result.analysis_type == "FORECASTING"
+    assert result.status == "NOT_SUPPORTED"
+
+
 def test_map_schema_flags_an_unresolvable_source_field(tmp_path):
     orders = pl.DataFrame({"order_id": [1, 2]})
 

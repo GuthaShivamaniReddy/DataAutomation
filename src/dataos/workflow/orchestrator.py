@@ -20,6 +20,7 @@ import uuid
 import polars as pl
 from pydantic import BaseModel
 
+from dataos.compiler.analytics_strategy_agent import AnalyticsStrategyAgent, AnalyticsStrategyResult
 from dataos.compiler.automation_builder import AutomationSpec, AutomationWorkflowBuilder
 from dataos.compiler.cleaning_strategy_agent import CleaningPlan, CleaningStrategyAgent
 from dataos.compiler.confidence_scorer import ConfidenceReport, ConfidenceScorer
@@ -120,6 +121,7 @@ class WorkflowOrchestrator:
         data_quality_assessor: DataQualityAssessor | None = None,
         operation_registry_selector: OperationRegistrySelector | None = None,
         cleaning_strategy_agent: CleaningStrategyAgent | None = None,
+        analytics_strategy_agent: AnalyticsStrategyAgent | None = None,
     ) -> None:
         self._registry = registry
         self._run_store = run_store
@@ -143,6 +145,7 @@ class WorkflowOrchestrator:
         self._data_quality_assessor = data_quality_assessor or DataQualityAssessor()
         self._operation_registry_selector = operation_registry_selector or OperationRegistrySelector(self._registry)
         self._cleaning_strategy_agent = cleaning_strategy_agent or CleaningStrategyAgent()
+        self._analytics_strategy_agent = analytics_strategy_agent or AnalyticsStrategyAgent()
 
     def check_drift(
         self,
@@ -342,6 +345,18 @@ class WorkflowOrchestrator:
         (e.g. the registered `deduplicate` operation).
         """
         return self._cleaning_strategy_agent.propose(contract=contract, quality_report=quality_report)
+
+    def select_analytics_strategy(self, contract: RequirementContract) -> AnalyticsStrategyResult:
+        """Analytics Strategy Agent (Section 15). Pure and read-only, like
+        `map_schema`/`assess_data_quality`: classifies the contract's
+        `objective` into one of Section 15's analysis categories and
+        decides whether this platform's current registry can actually
+        support it. CAUSAL, PREDICTIVE, FORECASTING, ANOMALY_DETECTION,
+        and PRESCRIPTIVE always come back NOT_SUPPORTED today - see the
+        module's own docstring for why - each with the closest valid
+        analysis this platform can run instead.
+        """
+        return self._analytics_strategy_agent.classify(contract=contract)
 
     def verify_external_actions(self, run_id: str, workflow: Workflow) -> list[ExternalActionVerification]:
         """Independent post-write verification for every planned external
