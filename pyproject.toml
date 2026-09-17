@@ -18,9 +18,19 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=9.1",
+    "httpx>=0.27",
 ]
 llm = [
     "anthropic>=0.40",
+]
+api = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "python-multipart>=0.0.9",
+]
+desktop = [
+    "pywebview>=5.3",
+    "pyinstaller>=6.10",
 ]
 
 [tool.setuptools.packages.find]
