@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from dataos.compiler.automation_builder import AutomationSpec, AutomationWorkflowBuilder
 from dataos.compiler.confidence_scorer import ConfidenceReport, ConfidenceScorer
 from dataos.compiler.connector_planner import ConnectorWritePlanner, ExternalActionPlan, ExternalActionVerification
+from dataos.compiler.data_quality_assessor import DataQualityAssessor, DataQualityReport
 from dataos.compiler.explanation_agent import Audience, ExplanationAgent, ExplanationOutput
 from dataos.compiler.independent_verifier import IndependentVerifier, VerifierResult
 from dataos.compiler.join_safety_reviewer import JoinReviewResult, JoinSafetyReviewer
@@ -114,6 +115,7 @@ class WorkflowOrchestrator:
         automation_builder: AutomationWorkflowBuilder | None = None,
         join_safety_reviewer: JoinSafetyReviewer | None = None,
         schema_mapping_agent: SchemaMappingAgent | None = None,
+        data_quality_assessor: DataQualityAssessor | None = None,
     ) -> None:
         self._registry = registry
         self._run_store = run_store
@@ -134,6 +136,7 @@ class WorkflowOrchestrator:
         self._automation_builder = automation_builder or AutomationWorkflowBuilder()
         self._join_safety_reviewer = join_safety_reviewer or JoinSafetyReviewer()
         self._schema_mapping_agent = schema_mapping_agent or SchemaMappingAgent()
+        self._data_quality_assessor = data_quality_assessor or DataQualityAssessor()
 
     def check_drift(
         self,
@@ -279,6 +282,26 @@ class WorkflowOrchestrator:
         `source:<name>` step-ref prefix `Workflow` inputs use.
         """
         return self._schema_mapping_agent.map(contract=contract, profiles=profiles)
+
+    def assess_data_quality(
+        self,
+        contract: RequirementContract,
+        profiles: dict[str, DatasetProfile],
+        *,
+        schema_mapping: SchemaMappingResult | None = None,
+    ) -> DataQualityReport:
+        """Data Quality Assessor (Section 8). Pure and read-only, like
+        `map_schema`: decides whether the profiled sources are fit for
+        *this* requirement, not source quality in the abstract. Passing
+        the `SchemaMappingResult` from `map_schema()` lets it check
+        completeness against the fields the contract's metrics/dimensions
+        actually resolved to, rather than every column in every profile;
+        omitting it just skips that one check (see the module's own
+        docstring for which other Section 8 bullets are intentionally
+        left to `review_joins`, `check_drift`, and `reconcile` instead of
+        being re-implemented here).
+        """
+        return self._data_quality_assessor.assess(contract=contract, profiles=profiles, schema_mapping=schema_mapping)
 
     def verify_external_actions(self, run_id: str, workflow: Workflow) -> list[ExternalActionVerification]:
         """Independent post-write verification for every planned external

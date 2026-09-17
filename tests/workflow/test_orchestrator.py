@@ -1037,6 +1037,44 @@ def test_map_schema_maps_a_governed_metric_to_its_source_field(tmp_path):
     assert result.blocking_items == []
 
 
+def test_assess_data_quality_reports_pass_for_clean_data(tmp_path):
+    orders = pl.DataFrame({"order_id": [1, 2, 3]})
+
+    registry = OperationRegistry()
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    contract = RequirementContract(objective="x", sources=[Source(name="orders")])
+    profiles = {"orders": profile_dataset(orders)}
+    result = orchestrator.assess_data_quality(contract, profiles)
+
+    assert result.fitness == "PASS"
+    assert result.issues == []
+
+
+def test_assess_data_quality_uses_schema_mapping_for_completeness(tmp_path):
+    orders = pl.DataFrame({"order_id": [1, 2, 3, 4], "note": [None, None, None, "x"]})
+
+    registry = OperationRegistry()
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    contract = RequirementContract(
+        objective="x",
+        sources=[Source(name="orders")],
+        metrics=[Metric(name="note_metric", source_fields=["orders.note"], definition_status=DefinitionStatus.GOVERNED)],
+    )
+    profiles = {"orders": profile_dataset(orders)}
+    schema_mapping = orchestrator.map_schema(contract, profiles)
+
+    result = orchestrator.assess_data_quality(contract, profiles, schema_mapping=schema_mapping)
+
+    assert result.fitness == "FAIL"
+    assert any(i.rule == "completeness:orders.note" for i in result.issues)
+
+
 def test_map_schema_flags_an_unresolvable_source_field(tmp_path):
     orders = pl.DataFrame({"order_id": [1, 2]})
 

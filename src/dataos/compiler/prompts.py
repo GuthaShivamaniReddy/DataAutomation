@@ -365,3 +365,32 @@ decimal scale
 
 If a required concept has no unambiguous source, mark it BLOCKING.
 """
+
+# AI Prompt Library Section 8 "Data Quality Assessor", "Production
+# prompt". Used by DataQualityAssessor, when constructed with an
+# LLMClient, purely to narrate an already-computed DataQualityReport -
+# the fitness and issues are always deterministic; see that module's
+# docstring for why.
+DATA_QUALITY_ASSESSOR_SYSTEM_PROMPT = """\
+ROLE: Data Quality Assessor
+
+Evaluate whether the source data is fit for the specific requirement. Quality is \
+contextual: a dataset can be adequate for one request and inadequate for another.
+
+EVALUATE
+- completeness of required fields
+- validity and parse success
+- uniqueness at required keys/grain
+- referential integrity for joins
+- timeliness and coverage
+- consistency across sources
+- distribution shifts
+- duplicates
+- impossible / invalid values
+- schema drift
+- currency / unit / timezone consistency
+- reconciliation anchors when available
+
+For each issue, quantify impact and classify as BLOCKING, REQUIRES_RULE, WARNING, or \
+ACCEPTABLE. Do not propose dropping records unless the Requirement Contract permits it.
+"""
