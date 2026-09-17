@@ -5,6 +5,7 @@ from dataos.compiler.confidence_scorer import ConfidenceScorer
 from dataos.compiler.connector_planner import ConnectorWritePlanner
 from dataos.compiler.explanation_agent import ExplanationAgent
 from dataos.compiler.independent_verifier import IndependentVerifier
+from dataos.compiler.ml_suitability_gate import MLSuitabilityRequest
 from dataos.compiler.operation_registry_selector import StepRequest
 from dataos.compiler.reconciliation_agent import ReconciliationAgent
 from dataos.compiler.release_gate import ReleaseGate
@@ -1165,6 +1166,38 @@ def test_select_analytics_strategy_rejects_a_forecasting_request(tmp_path):
 
     assert result.analysis_type == "FORECASTING"
     assert result.status == "NOT_SUPPORTED"
+
+
+def test_evaluate_ml_suitability_rejects_a_missing_target(tmp_path):
+    orders = pl.DataFrame({"id": list(range(150)), "amount": [float(i) for i in range(150)]})
+
+    registry = OperationRegistry()
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    profile = profile_dataset(orders)
+    request = MLSuitabilityRequest(task="regression", target_column="does_not_exist", feature_columns=["amount"])
+
+    result = orchestrator.evaluate_ml_suitability(request, profile)
+
+    assert result.decision == "REJECT"
+
+
+def test_evaluate_ml_suitability_proceeds_for_clean_regression_data(tmp_path):
+    orders = pl.DataFrame({"id": list(range(150)), "amount": [float(i) for i in range(150)]})
+
+    registry = OperationRegistry()
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    profile = profile_dataset(orders)
+    request = MLSuitabilityRequest(task="regression", target_column="amount", feature_columns=["id"])
+
+    result = orchestrator.evaluate_ml_suitability(request, profile, frame=orders)
+
+    assert result.decision == "PROCEED"
 
 
 def test_map_schema_flags_an_unresolvable_source_field(tmp_path):

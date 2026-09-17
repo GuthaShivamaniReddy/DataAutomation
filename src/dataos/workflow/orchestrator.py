@@ -29,6 +29,7 @@ from dataos.compiler.data_quality_assessor import DataQualityAssessor, DataQuali
 from dataos.compiler.explanation_agent import Audience, ExplanationAgent, ExplanationOutput
 from dataos.compiler.independent_verifier import IndependentVerifier, VerifierResult
 from dataos.compiler.join_safety_reviewer import JoinReviewResult, JoinSafetyReviewer
+from dataos.compiler.ml_suitability_gate import MLSuitabilityGate, MLSuitabilityRequest, MLSuitabilityResult
 from dataos.compiler.operation_registry_selector import OperationRegistrySelector, SelectorResult, StepRequest
 from dataos.compiler.pii_classifier import PIIClassifier
 from dataos.compiler.policy_gate import PolicyDecision, PolicyGate
@@ -122,6 +123,7 @@ class WorkflowOrchestrator:
         operation_registry_selector: OperationRegistrySelector | None = None,
         cleaning_strategy_agent: CleaningStrategyAgent | None = None,
         analytics_strategy_agent: AnalyticsStrategyAgent | None = None,
+        ml_suitability_gate: MLSuitabilityGate | None = None,
     ) -> None:
         self._registry = registry
         self._run_store = run_store
@@ -146,6 +148,7 @@ class WorkflowOrchestrator:
         self._operation_registry_selector = operation_registry_selector or OperationRegistrySelector(self._registry)
         self._cleaning_strategy_agent = cleaning_strategy_agent or CleaningStrategyAgent()
         self._analytics_strategy_agent = analytics_strategy_agent or AnalyticsStrategyAgent()
+        self._ml_suitability_gate = ml_suitability_gate or MLSuitabilityGate()
 
     def check_drift(
         self,
@@ -357,6 +360,24 @@ class WorkflowOrchestrator:
         analysis this platform can run instead.
         """
         return self._analytics_strategy_agent.classify(contract=contract)
+
+    def evaluate_ml_suitability(
+        self,
+        request: MLSuitabilityRequest,
+        profile: DatasetProfile,
+        *,
+        frame: pl.DataFrame | None = None,
+    ) -> MLSuitabilityResult:
+        """Forecasting/ML Suitability Gate (Section 16). Pure and
+        read-only, like `select_analytics_strategy`: decides whether the
+        *data* is suitable for the requested predictive/forecasting task
+        (target/leakage/sample-size/time-column checks from `profile`,
+        plus a real class-imbalance check when `frame` is supplied) -
+        never whether this platform can actually train the model, which
+        it cannot yet (see the module's own docstring for why that is
+        always surfaced as a standing risk rather than forcing REJECT).
+        """
+        return self._ml_suitability_gate.evaluate(request=request, profile=profile, frame=frame)
 
     def verify_external_actions(self, run_id: str, workflow: Workflow) -> list[ExternalActionVerification]:
         """Independent post-write verification for every planned external
