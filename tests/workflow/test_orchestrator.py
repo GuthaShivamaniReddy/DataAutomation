@@ -1008,6 +1008,62 @@ def test_review_joins_without_key_evidence_raises(tmp_path):
     assert excinfo.value.code == ErrorCode.SCHEMA_MISSING
 
 
+def test_map_schema_maps_a_governed_metric_to_its_source_field(tmp_path):
+    orders = pl.DataFrame({"order_id": [1, 2], "net_amount": [100.0, 200.0]})
+
+    registry = OperationRegistry()
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    contract = RequirementContract(
+        objective="report revenue",
+        sources=[Source(name="orders")],
+        metrics=[
+            Metric(
+                name="revenue",
+                source_fields=["orders.net_amount"],
+                definition_status=DefinitionStatus.GOVERNED,
+            )
+        ],
+    )
+    profiles = {"orders": profile_dataset(orders)}
+
+    result = orchestrator.map_schema(contract, profiles)
+
+    assert result.mappings[0].status == "MAPPED"
+    assert result.mappings[0].dataset == "orders"
+    assert result.mappings[0].column == "net_amount"
+    assert result.blocking_items == []
+
+
+def test_map_schema_flags_an_unresolvable_source_field(tmp_path):
+    orders = pl.DataFrame({"order_id": [1, 2]})
+
+    registry = OperationRegistry()
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    contract = RequirementContract(
+        objective="report revenue",
+        sources=[Source(name="orders")],
+        metrics=[
+            Metric(
+                name="revenue",
+                source_fields=["orders.net_amount"],
+                definition_status=DefinitionStatus.GOVERNED,
+            )
+        ],
+    )
+    profiles = {"orders": profile_dataset(orders)}
+
+    result = orchestrator.map_schema(contract, profiles)
+
+    assert result.mappings[0].status == "MISSING"
+    assert len(result.blocking_items) == 1
+
+
 def test_plan_external_actions_without_connector_planner_raises(tmp_path):
     registry = OperationRegistry()
     run_store = RunStore(tmp_path / "runs.db")

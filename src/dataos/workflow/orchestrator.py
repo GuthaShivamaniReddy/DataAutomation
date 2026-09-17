@@ -31,6 +31,7 @@ from dataos.compiler.policy_gate import PolicyDecision, PolicyGate
 from dataos.compiler.reconciliation_agent import ReconciliationAgent, ReconciliationReport
 from dataos.compiler.release_gate import ReleaseDecision, ReleaseGate
 from dataos.compiler.schema_drift_monitor import DriftReport, SchemaDriftMonitor
+from dataos.compiler.schema_mapping_agent import SchemaMappingAgent, SchemaMappingResult
 from dataos.compiler.security_guard import SecurityGuard
 from dataos.compiler.validation_rule_generator import CheckSpec, ValidationRuleGenerator
 from dataos.compiler.workflow_planner import PlannerOutput, WorkflowPlanner
@@ -112,6 +113,7 @@ class WorkflowOrchestrator:
         connector_planner: ConnectorWritePlanner | None = None,
         automation_builder: AutomationWorkflowBuilder | None = None,
         join_safety_reviewer: JoinSafetyReviewer | None = None,
+        schema_mapping_agent: SchemaMappingAgent | None = None,
     ) -> None:
         self._registry = registry
         self._run_store = run_store
@@ -131,6 +133,7 @@ class WorkflowOrchestrator:
         self._connector_planner = connector_planner
         self._automation_builder = automation_builder or AutomationWorkflowBuilder()
         self._join_safety_reviewer = join_safety_reviewer or JoinSafetyReviewer()
+        self._schema_mapping_agent = schema_mapping_agent or SchemaMappingAgent()
 
     def check_drift(
         self,
@@ -255,6 +258,27 @@ class WorkflowOrchestrator:
                 right_frame=frames.get(right_ref),
             )
         return results
+
+    def map_schema(
+        self,
+        contract: RequirementContract,
+        profiles: dict[str, DatasetProfile],
+    ) -> SchemaMappingResult:
+        """Schema Mapping Agent (Section 7). Pure and read-only, like
+        `review_joins`/`generate_validation_checks`: links the contract's
+        metrics/dimensions to concrete profiled columns and reports any
+        concept with no unambiguous source, but does not gate `start_run`
+        itself - a caller assembling or approving a plan calls this to
+        catch a broken or colliding mapping before a human signs off on
+        the workflow it would otherwise be built from.
+
+        `profiles` keys are dataset names exactly as they appear in a
+        governed `Metric.source_fields` entry (`"<dataset>.<column>"`) or
+        as this orchestrator's other dataset-keyed methods
+        (`check_drift`, `review_joins`) already expect - never the
+        `source:<name>` step-ref prefix `Workflow` inputs use.
+        """
+        return self._schema_mapping_agent.map(contract=contract, profiles=profiles)
 
     def verify_external_actions(self, run_id: str, workflow: Workflow) -> list[ExternalActionVerification]:
         """Independent post-write verification for every planned external

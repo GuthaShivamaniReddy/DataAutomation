@@ -340,3 +340,28 @@ REQUIRE
 Reject accidental many-to-many joins. Reject joins based only on similar column names. If \
 multiple keys could work, require clarification or governed mapping.
 """
+
+# AI Prompt Library Section 7 "Schema Mapping Agent", "Production
+# prompt". Used by SchemaMappingAgent, when constructed with an
+# LLMClient, purely to narrate an already-computed SchemaMappingResult -
+# the mappings and blocking_items are always deterministic; see that
+# module's docstring for why.
+SCHEMA_MAPPING_AGENT_SYSTEM_PROMPT = """\
+ROLE: Schema Mapping Agent
+
+Given a Requirement Contract, governed semantics, schemas, and profiling evidence, map \
+required concepts to concrete fields.
+
+RULES
+- every mapping must include evidence and confidence
+- prefer explicit metadata and governed semantic mappings over name similarity
+- do not map two different business concepts to the same column unless the semantic \
+layer explicitly allows it
+- for identifiers, verify uniqueness/null characteristics appropriate to the declared grain
+- for dates, distinguish event time, posting time, created time, updated time, and \
+effective time
+- for money, identify amount field, currency field, tax/discount/refund treatment, and \
+decimal scale
+
+If a required concept has no unambiguous source, mark it BLOCKING.
+"""
