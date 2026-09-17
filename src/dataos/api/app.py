@@ -27,6 +27,7 @@ from pydantic import BaseModel
 
 from dataos.api.store import ContractRecord, DatasetRecord, SessionStore
 from dataos.compiler.analytics_strategy_agent import AnalyticsStrategyResult
+from dataos.compiler.cleaning_strategy_agent import CleaningPlan
 from dataos.compiler.data_quality_assessor import DataQualityReport
 from dataos.compiler.explanation_agent import ExplanationAgent
 from dataos.compiler.requirement_compiler import RequirementCompiler
@@ -133,8 +134,37 @@ class PlanReviewResponse(BaseModel):
     steps: list[WorkflowStep]
     schema_mapping: SchemaMappingResult
     data_quality: DataQualityReport
+    cleaning_plan: CleaningPlan
+    approved_cleaning_rule_ids: list[str]
     analytics_strategy: AnalyticsStrategyResult
     blocking: bool
+
+
+class ApproveCleaningRulesRequest(BaseModel):
+    rule_ids: list[str]
+
+
+def _unapproved_required_cleaning_rules(cleaning_plan: CleaningPlan, approved_rule_ids: list[str]) -> list[str]:
+    """A rule the agent marked `approval_required` (every lossy fix) still
+    blocks the run until a human has approved that exact rule id - see
+    `cleaning_strategy_agent.py`'s own "never automatically apply a lossy
+    rule" discipline."""
+    approved = set(approved_rule_ids)
+    return [r.rule_id for r in cleaning_plan.rules if r.approval_required and r.rule_id not in approved]
+
+
+def _plan_blocking(
+    schema_mapping: SchemaMappingResult,
+    data_quality: DataQualityReport,
+    cleaning_plan: CleaningPlan,
+    approved_cleaning_rule_ids: list[str],
+) -> bool:
+    return (
+        bool(schema_mapping.blocking_items)
+        or data_quality.fitness == "FAIL"
+        or bool(cleaning_plan.blocking_items)
+        or bool(_unapproved_required_cleaning_rules(cleaning_plan, approved_cleaning_rule_ids))
+    )
 
 
 def create_app(
@@ -293,7 +323,6 @@ def create_app(
 
         planner_output = planner.plan(contract=record.contract, contract_id=contract_id)
         workflow = planner_output.workflow
-        session_store.update_contract(contract_id, workflow=workflow)
 
         profiles = {
             name: session_store.require_dataset(did).profile
@@ -302,14 +331,54 @@ def create_app(
         orchestrator = _new_orchestrator()
         schema_mapping = orchestrator.map_schema(record.contract, profiles)
         data_quality = orchestrator.assess_data_quality(record.contract, profiles, schema_mapping=schema_mapping)
+        cleaning_plan = orchestrator.propose_cleaning_rules(record.contract, quality_report=data_quality)
         analytics = orchestrator.select_analytics_strategy(record.contract)
 
-        blocking = bool(schema_mapping.blocking_items) or data_quality.fitness == "FAIL"
+        session_store.update_contract(contract_id, workflow=workflow, cleaning_plan=cleaning_plan)
+
+        blocking = _plan_blocking(schema_mapping, data_quality, cleaning_plan, approved_cleaning_rule_ids=[])
         return PlanReviewResponse(
             workflow_id=contract_id,
             steps=workflow.steps,
             schema_mapping=schema_mapping,
             data_quality=data_quality,
+            cleaning_plan=cleaning_plan,
+            approved_cleaning_rule_ids=[],
+            analytics_strategy=analytics,
+            blocking=blocking,
+        )
+
+    @app.post("/api/requirements/{contract_id}/cleaning/approve", response_model=PlanReviewResponse)
+    async def approve_cleaning_rules(contract_id: str, request: ApproveCleaningRulesRequest) -> PlanReviewResponse:
+        record = session_store.require_contract(contract_id)
+        if record.workflow is None or record.cleaning_plan is None:
+            raise HTTPException(status_code=409, detail="call /plan before approving cleaning rules")
+
+        profiles = {
+            name: session_store.require_dataset(did).profile
+            for name, did in record.dataset_ids_by_source_name.items()
+        }
+        approved_rule_ids = sorted(set(record.approved_cleaning_rule_ids) | set(request.rule_ids))
+        orchestrator = _new_orchestrator()
+        workflow = orchestrator.apply_cleaning_rules(
+            record.workflow, record.cleaning_plan, approved_rule_ids, profiles=profiles
+        )
+
+        session_store.update_contract(
+            contract_id, workflow=workflow, approved_cleaning_rule_ids=approved_rule_ids
+        )
+
+        schema_mapping = orchestrator.map_schema(record.contract, profiles)
+        data_quality = orchestrator.assess_data_quality(record.contract, profiles, schema_mapping=schema_mapping)
+        analytics = orchestrator.select_analytics_strategy(record.contract)
+        blocking = _plan_blocking(schema_mapping, data_quality, record.cleaning_plan, approved_rule_ids)
+        return PlanReviewResponse(
+            workflow_id=contract_id,
+            steps=workflow.steps,
+            schema_mapping=schema_mapping,
+            data_quality=data_quality,
+            cleaning_plan=record.cleaning_plan,
+            approved_cleaning_rule_ids=approved_rule_ids,
             analytics_strategy=analytics,
             blocking=blocking,
         )
@@ -319,6 +388,16 @@ def create_app(
         record = session_store.require_contract(contract_id)
         if record.workflow is None:
             raise HTTPException(status_code=409, detail="call /plan before /start")
+        if record.cleaning_plan is not None:
+            unresolved = _unapproved_required_cleaning_rules(record.cleaning_plan, record.approved_cleaning_rule_ids)
+            if unresolved:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "unresolved cleaning rule(s) require approval before this run can start",
+                        "rule_ids": unresolved,
+                    },
+                )
 
         source_frames = {
             name: session_store.load_dataset_frame(did) for name, did in record.dataset_ids_by_source_name.items()

@@ -52,7 +52,7 @@ from dataos.semantics.dictionary import SemanticDictionary
 from dataos.validation.engine import ValidationReport
 from dataos.validation.executor import ValidationRuleExecutor
 from dataos.workflow.artifact_store import ArtifactStore
-from dataos.workflow.dsl import SOURCE_PREFIX, Workflow
+from dataos.workflow.dsl import SOURCE_PREFIX, Workflow, WorkflowStep
 from dataos.workflow.state_machine import RunState
 from dataos.workflow.store import RunRecord, RunStore, StepRunRecord, now_iso
 
@@ -355,6 +355,108 @@ class WorkflowOrchestrator:
         (e.g. the registered `deduplicate` operation).
         """
         return self._cleaning_strategy_agent.propose(contract=contract, quality_report=quality_report)
+
+    def apply_cleaning_rules(
+        self,
+        workflow: Workflow,
+        cleaning_plan: CleaningPlan,
+        approved_rule_ids: list[str],
+        *,
+        profiles: dict[str, DatasetProfile] | None = None,
+    ) -> Workflow:
+        """Materializes human-approved rules from `propose_cleaning_rules()`
+        (Section 11) into real steps, deterministically - this method
+        never proposes anything itself, it only ever applies a rule the
+        agent already proposed and a human already approved, exactly
+        Section 11's "a rule only takes effect once a human approves it
+        and it is expressed as an actual workflow step" contract.
+
+        Each approved `text_clean:<dataset>.<column>` rule becomes a
+        `text_clean` step (trim+lower, `allow_identity_collapse=True` -
+        the agent only ever proposes this rule once profiling has already
+        proven the collapse is case/whitespace-only); each approved
+        `dedup:<dataset>` rule becomes a `deduplicate` step keyed on every
+        column of that dataset (`profiles` is required to resolve those
+        keys - the agent's own rule text is "full-row match"). New steps
+        are inserted directly on top of the source they clean, and every
+        existing step that previously read straight from that source is
+        rewired to read the cleaned output instead, so nothing downstream
+        can still see the unclean column. Approving an id this plan never
+        proposed, or one with no registered operation to run it (e.g. a
+        `null_policy:*` rule - there is no `impute` operation yet), is
+        rejected outright rather than silently ignored.
+        """
+        rules_by_id = {rule.rule_id: rule for rule in cleaning_plan.rules}
+        unknown = [rule_id for rule_id in approved_rule_ids if rule_id not in rules_by_id]
+        if unknown:
+            raise PlatformError(
+                ErrorCode.VALIDATION_FAIL,
+                f"cannot approve rule id(s) not proposed by the Cleaning Strategy Agent: {unknown}",
+                evidence={"proposed_rule_ids": sorted(rules_by_id)},
+            )
+
+        new_steps: list[WorkflowStep] = []
+        rewrite: dict[str, str] = {}
+
+        for rule_id in approved_rule_ids:
+            rule = rules_by_id[rule_id]
+            if rule.rule_id.startswith("text_clean:"):
+                dataset, _, column = rule.rule_id.split(":", 1)[1].partition(".")
+                source_ref = f"{SOURCE_PREFIX}{dataset}"
+                step_id = f"cleaning_text_clean_{dataset}_{column}"
+                new_steps.append(
+                    WorkflowStep(
+                        id=step_id,
+                        operation_id="text_clean",
+                        operation_version="1.0",
+                        inputs=[rewrite.get(source_ref, source_ref)],
+                        params={
+                            "normalize": [{"column": column, "steps": ["trim", "lower"]}],
+                            "allow_identity_collapse": True,
+                        },
+                        on_failure="STOP",
+                        requirement_refs=[rule.rule_id],
+                    )
+                )
+                rewrite[source_ref] = step_id
+            elif rule.rule_id.startswith("dedup:"):
+                dataset = rule.rule_id.split(":", 1)[1]
+                profile = (profiles or {}).get(dataset)
+                if profile is None:
+                    raise PlatformError(
+                        ErrorCode.VALIDATION_FAIL,
+                        f"cannot apply rule '{rule_id}': profile for dataset '{dataset}' was not supplied",
+                    )
+                source_ref = f"{SOURCE_PREFIX}{dataset}"
+                step_id = f"cleaning_dedup_{dataset}"
+                new_steps.append(
+                    WorkflowStep(
+                        id=step_id,
+                        operation_id="deduplicate",
+                        operation_version="1.0",
+                        inputs=[rewrite.get(source_ref, source_ref)],
+                        params={"keys": [c.name for c in profile.columns], "keep": "first"},
+                        on_failure="STOP",
+                        requirement_refs=[rule.rule_id],
+                    )
+                )
+                rewrite[source_ref] = step_id
+            else:
+                raise PlatformError(
+                    ErrorCode.NO_SAFE_OPERATION,
+                    f"rule '{rule_id}' has no registered operation to apply it - it must be resolved another way",
+                )
+
+        if not new_steps:
+            return workflow
+
+        rewired_steps = [
+            step.model_copy(update={"inputs": [rewrite.get(ref, ref) for ref in step.inputs]})
+            for step in workflow.steps
+        ]
+        result = workflow.model_copy(update={"steps": new_steps + rewired_steps})
+        result.validate_dag()
+        return result
 
     def select_analytics_strategy(self, contract: RequirementContract) -> AnalyticsStrategyResult:
         """Analytics Strategy Agent (Section 15). Pure and read-only, like

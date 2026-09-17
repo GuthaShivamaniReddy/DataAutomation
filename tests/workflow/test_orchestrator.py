@@ -1348,6 +1348,130 @@ def test_propose_cleaning_rules_blocks_an_ungoverned_completeness_gap(tmp_path):
     assert any(b.field == "orders.customer_age" for b in result.blocking_items)
 
 
+def test_apply_cleaning_rules_inserts_a_text_clean_step_and_rewires_downstream_inputs(tmp_path):
+    orders = pl.DataFrame(
+        {
+            "order_id": [1, 2, 3, 4, 5],
+            "region": ["EAST", "East", "West ", "north", "South"],
+        }
+    )
+
+    registry = OperationRegistry()
+    for op_cls in (AggregateOperation,):
+        registry.register(op_cls())
+    from dataos.registry.operations.text_clean import TextCleanOperation
+
+    registry.register(TextCleanOperation())
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    contract = RequirementContract(objective="show order count by region", sources=[Source(name="orders")], dimensions=["region"])
+    profiles = {"orders": profile_dataset(orders)}
+    schema_mapping = orchestrator.map_schema(contract, profiles)
+    quality_report = orchestrator.assess_data_quality(contract, profiles, schema_mapping=schema_mapping)
+    cleaning_plan = orchestrator.propose_cleaning_rules(contract, quality_report=quality_report)
+    rule = next(r for r in cleaning_plan.rules if r.rule_id == "text_clean:orders.region")
+
+    workflow = Workflow(
+        workflow_version=1,
+        requirement_contract_id="rc_test",
+        sources=["orders"],
+        steps=[
+            WorkflowStep(
+                id="agg",
+                operation_id="aggregate",
+                operation_version="1.0",
+                inputs=["source:orders"],
+                params={"group_by": ["region"], "metrics": [{"name": "order_count", "column": "order_id", "fn": "count"}]},
+            )
+        ],
+    )
+
+    patched = orchestrator.apply_cleaning_rules(workflow, cleaning_plan, [rule.rule_id])
+
+    assert [s.id for s in patched.steps] == ["cleaning_text_clean_orders_region", "agg"]
+    cleaning_step = patched.steps[0]
+    assert cleaning_step.inputs == ["source:orders"]
+    assert cleaning_step.params["normalize"] == [{"column": "region", "steps": ["trim", "lower"]}]
+    assert cleaning_step.params["allow_identity_collapse"] is True
+    assert patched.step_by_id("agg").inputs == ["cleaning_text_clean_orders_region"]
+
+    csv_path = tmp_path / "orders.csv"
+    orders.write_csv(csv_path)
+    version = ingest_file(csv_path, storage_root=tmp_path / "dataos_store")
+    run_id = orchestrator.start_run(patched, source_frames={"orders": orders}, source_versions={"orders": version})
+    run = orchestrator.run(run_id, patched)
+
+    assert run.state == RunState.VERIFYING
+    result_df = artifact_store.load_by_ids(run_id, "agg")
+    counts = dict(zip(result_df["region"].to_list(), result_df["order_count"].to_list()))
+    # "EAST"/"East" collapse to "east"; "West " collapses to "west"; 4 distinct groups, not 5.
+    assert counts == {"east": 2, "west": 1, "north": 1, "south": 1}
+
+
+def test_apply_cleaning_rules_rejects_an_unproposed_rule_id(tmp_path):
+    registry = OperationRegistry()
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    workflow = Workflow(workflow_version=1, requirement_contract_id="rc_test", sources=["orders"], steps=[])
+    empty_plan = orchestrator.propose_cleaning_rules(RequirementContract(objective="x", sources=[Source(name="orders")]))
+
+    with pytest.raises(PlatformError) as exc_info:
+        orchestrator.apply_cleaning_rules(workflow, empty_plan, ["text_clean:orders.region"])
+
+    assert exc_info.value.code == ErrorCode.VALIDATION_FAIL
+
+
+def test_apply_cleaning_rules_rejects_a_rule_with_no_registered_operation(tmp_path):
+    registry = OperationRegistry()
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    workflow = Workflow(workflow_version=1, requirement_contract_id="rc_test", sources=["orders"], steps=[])
+    contract = RequirementContract(objective="x", sources=[Source(name="orders")], null_policy={"net_amount": "fill:0"})
+    plan = orchestrator.propose_cleaning_rules(contract)
+
+    with pytest.raises(PlatformError) as exc_info:
+        orchestrator.apply_cleaning_rules(workflow, plan, ["null_policy:net_amount"])
+
+    assert exc_info.value.code == ErrorCode.NO_SAFE_OPERATION
+
+
+def test_apply_cleaning_rules_dedup_requires_profiles_and_keys_on_every_column(tmp_path):
+    orders = pl.DataFrame({"order_id": [1, 1, 2], "region": ["East", "East", "West"]})
+
+    registry = OperationRegistry()
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    contract = RequirementContract(objective="x", sources=[Source(name="orders")])
+    profiles = {"orders": profile_dataset(orders)}
+    quality_report = orchestrator.assess_data_quality(contract, profiles)
+    plan = orchestrator.propose_cleaning_rules(contract, quality_report=quality_report)
+    rule = next(r for r in plan.rules if r.rule_id == "dedup:orders")
+
+    workflow = Workflow(
+        workflow_version=1,
+        requirement_contract_id="rc_test",
+        sources=["orders"],
+        steps=[WorkflowStep(id="agg", operation_id="aggregate", operation_version="1.0", inputs=["source:orders"], params={})],
+    )
+
+    with pytest.raises(PlatformError) as exc_info:
+        orchestrator.apply_cleaning_rules(workflow, plan, [rule.rule_id])
+    assert exc_info.value.code == ErrorCode.VALIDATION_FAIL
+
+    patched = orchestrator.apply_cleaning_rules(workflow, plan, [rule.rule_id], profiles=profiles)
+    dedup_step = patched.step_by_id("cleaning_dedup_orders")
+    assert set(dedup_step.params["keys"]) == {"order_id", "region"}
+    assert patched.step_by_id("agg").inputs == ["cleaning_dedup_orders"]
+
+
 def test_select_analytics_strategy_approves_a_descriptive_request(tmp_path):
     registry = OperationRegistry()
     run_store = RunStore(tmp_path / "runs.db")

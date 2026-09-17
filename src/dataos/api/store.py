@@ -22,6 +22,7 @@ from pathlib import Path
 import polars as pl
 from pydantic import BaseModel, Field
 
+from dataos.compiler.cleaning_strategy_agent import CleaningPlan
 from dataos.contracts.requirement_contract import RequirementContract
 from dataos.errors import ErrorCode, PlatformError
 from dataos.ingestion.profiling import DatasetProfile, profile_dataset
@@ -46,6 +47,8 @@ class ContractRecord(BaseModel):
     contract: RequirementContract
     dataset_ids_by_source_name: dict[str, str] = Field(default_factory=dict)
     workflow: Workflow | None = None
+    cleaning_plan: CleaningPlan | None = None
+    approved_cleaning_rule_ids: list[str] = Field(default_factory=list)
     run_id: str | None = None
     created_at: str
     updated_at: str
@@ -146,6 +149,8 @@ class SessionStore:
         *,
         contract: RequirementContract | None = None,
         workflow: Workflow | None = None,
+        cleaning_plan: CleaningPlan | None = None,
+        approved_cleaning_rule_ids: list[str] | None = None,
         run_id: str | None = None,
     ) -> ContractRecord:
         record = self.require_contract(contract_id)
@@ -154,6 +159,14 @@ class SessionStore:
             updates["contract"] = contract
         if workflow is not None:
             updates["workflow"] = workflow
+        if cleaning_plan is not None:
+            # A freshly (re-)planned cleaning plan invalidates any earlier
+            # approvals - they were decisions about the old plan's rule
+            # ids, never automatically carried forward onto a new one.
+            updates["cleaning_plan"] = cleaning_plan
+            updates["approved_cleaning_rule_ids"] = []
+        if approved_cleaning_rule_ids is not None:
+            updates["approved_cleaning_rule_ids"] = approved_cleaning_rule_ids
         if run_id is not None:
             updates["run_id"] = run_id
         updated = record.model_copy(update=updates)

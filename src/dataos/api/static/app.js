@@ -10,6 +10,7 @@ const state = {
   resultOffset: 0,
   resultLimit: 50,
   resultRowCount: 0,
+  lastPlan: null,
 };
 
 async function api(path, options = {}) {
@@ -179,6 +180,7 @@ el("plan-btn").addEventListener("click", async () => {
 });
 
 function renderPlan(plan) {
+  state.lastPlan = plan;
   const panel = el("plan-panel");
   const mappingIssues = plan.schema_mapping.blocking_items
     .map((b) => `<div class="issue-row"><span class="pill blocking">MAPPING</span>${escapeHtml(b.reason)}</div>`)
@@ -186,13 +188,18 @@ function renderPlan(plan) {
   const qualityIssues = plan.data_quality.issues
     .map((i) => `<div class="issue-row"><span class="pill ${i.severity === "BLOCKING" ? "blocking" : "warn"}">${i.severity}</span>${escapeHtml(i.rule)}: ${escapeHtml(i.observed)}</div>`)
     .join("");
+  const cleaningBlockingIssues = plan.cleaning_plan.blocking_items
+    .map((b) => `<div class="issue-row"><span class="pill blocking">CLEANING</span>${escapeHtml(b.field)}: ${escapeHtml(b.reason)}</div>`)
+    .join("");
 
   panel.innerHTML = `
     <div><strong>Steps:</strong> ${plan.steps.map((s) => `${s.operation_id}`).join(" &rarr; ") || "none"}</div>
     <div><strong>Data quality:</strong> ${plan.data_quality.fitness}</div>
     <div><strong>Analytics strategy:</strong> ${plan.analytics_strategy.analysis_type} (${plan.analytics_strategy.status})</div>
-    ${mappingIssues || qualityIssues ? `<h4>Issues</h4>${mappingIssues}${qualityIssues}` : ""}
+    ${mappingIssues || qualityIssues || cleaningBlockingIssues ? `<h4>Issues</h4>${mappingIssues}${qualityIssues}${cleaningBlockingIssues}` : ""}
   `;
+
+  renderCleaningPlan(plan);
 
   document.querySelector("#section-run").classList.toggle("hidden", plan.blocking);
   el("start-btn").classList.toggle("hidden", plan.blocking);
@@ -200,6 +207,51 @@ function renderPlan(plan) {
     panel.innerHTML += `<p class="pill blocking">Blocked - resolve the issue(s) above before running.</p>`;
   }
 }
+
+function renderCleaningPlan(plan) {
+  const cleaningPanel = el("cleaning-panel");
+  const rules = plan.cleaning_plan.rules;
+  if (rules.length === 0) {
+    cleaningPanel.classList.add("hidden");
+    return;
+  }
+  cleaningPanel.classList.remove("hidden");
+
+  const approvedIds = new Set(plan.approved_cleaning_rule_ids);
+  const list = el("cleaning-rules-list");
+  list.innerHTML = rules
+    .map((rule) => {
+      const approved = approvedIds.has(rule.rule_id);
+      const needsApproval = rule.approval_required && !approved;
+      return `
+        <div class="issue-row">
+          ${needsApproval ? `<input type="checkbox" class="cleaning-rule-checkbox" value="${escapeHtml(rule.rule_id)}" />` : ""}
+          <span class="pill ${approved ? "ok" : "warn"}">${approved ? "APPROVED" : rule.approval_required ? "NEEDS APPROVAL" : "AUTO"}</span>
+          <strong>${escapeHtml(rule.rule_id)}</strong>: ${escapeHtml(rule.action)}
+          ${rule.expected_impact ? `<div class="hint">${escapeHtml(rule.expected_impact)}</div>` : ""}
+        </div>
+      `;
+    })
+    .join("");
+
+  const anyNeedsApproval = rules.some((r) => r.approval_required && !approvedIds.has(r.rule_id));
+  el("approve-cleaning-btn").classList.toggle("hidden", !anyNeedsApproval);
+}
+
+el("approve-cleaning-btn").addEventListener("click", async () => {
+  const ruleIds = [...document.querySelectorAll(".cleaning-rule-checkbox:checked")].map((cb) => cb.value);
+  if (ruleIds.length === 0) return showError(new Error("select at least one rule to approve"));
+  try {
+    const plan = await api(`/api/requirements/${state.contractId}/cleaning/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rule_ids: ruleIds }),
+    });
+    renderPlan(plan);
+  } catch (err) {
+    showError(err);
+  }
+});
 
 el("start-btn").addEventListener("click", async () => {
   try {
