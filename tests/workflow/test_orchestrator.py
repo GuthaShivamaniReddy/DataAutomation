@@ -1245,6 +1245,51 @@ def test_evaluate_ml_suitability_proceeds_for_clean_regression_data(tmp_path):
     assert result.decision == "PROCEED"
 
 
+def test_diagnose_incident_reports_quarantine_for_a_data_failure(fixtures_dir, tmp_path):
+    df = pl.read_csv(fixtures_dir / "orders_basic.csv")
+    version = ingest_file(fixtures_dir / "orders_basic.csv", storage_root=tmp_path / "dataos_store")
+
+    registry = OperationRegistry()
+    registry.register(SelectFilterOperation())
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    workflow = Workflow(
+        workflow_version=1,
+        requirement_contract_id="rc_incident_test",
+        sources=["orders"],
+        steps=[
+            WorkflowStep(
+                id="s1",
+                operation_id="select_filter",
+                operation_version="1.0",
+                inputs=["source:orders"],
+                params={"columns": ["does_not_exist"]},
+            )
+        ],
+    )
+    run_id = orchestrator.start_run(workflow, source_frames={"orders": df}, source_versions={"orders": version})
+    orchestrator.run(run_id, workflow)
+
+    result = orchestrator.diagnose_incident(run_id)
+
+    assert result.failure_class == "DATA"
+    assert result.safe_action == "QUARANTINE"
+
+
+def test_diagnose_incident_raises_for_an_unknown_run(tmp_path):
+    registry = OperationRegistry()
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    with pytest.raises(PlatformError) as excinfo:
+        orchestrator.diagnose_incident("no-such-run")
+
+    assert excinfo.value.code == ErrorCode.SCHEMA_MISSING
+
+
 def test_map_schema_flags_an_unresolvable_source_field(tmp_path):
     orders = pl.DataFrame({"order_id": [1, 2]})
 

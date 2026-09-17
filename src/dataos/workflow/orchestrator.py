@@ -27,6 +27,7 @@ from dataos.compiler.confidence_scorer import ConfidenceReport, ConfidenceScorer
 from dataos.compiler.connector_planner import ConnectorWritePlanner, ExternalActionPlan, ExternalActionVerification
 from dataos.compiler.data_quality_assessor import DataQualityAssessor, DataQualityReport
 from dataos.compiler.explanation_agent import Audience, ExplanationAgent, ExplanationOutput
+from dataos.compiler.incident_recovery_agent import IncidentRecoveryAgent, IncidentRecoveryResult
 from dataos.compiler.independent_verifier import IndependentVerifier, VerifierResult
 from dataos.compiler.join_safety_reviewer import JoinReviewResult, JoinSafetyReviewer
 from dataos.compiler.ml_suitability_gate import MLSuitabilityGate, MLSuitabilityRequest, MLSuitabilityResult
@@ -126,6 +127,7 @@ class WorkflowOrchestrator:
         analytics_strategy_agent: AnalyticsStrategyAgent | None = None,
         ml_suitability_gate: MLSuitabilityGate | None = None,
         visualization_planner: VisualizationPlanner | None = None,
+        incident_recovery_agent: IncidentRecoveryAgent | None = None,
     ) -> None:
         self._registry = registry
         self._run_store = run_store
@@ -152,6 +154,7 @@ class WorkflowOrchestrator:
         self._analytics_strategy_agent = analytics_strategy_agent or AnalyticsStrategyAgent()
         self._ml_suitability_gate = ml_suitability_gate or MLSuitabilityGate()
         self._visualization_planner = visualization_planner or VisualizationPlanner()
+        self._incident_recovery_agent = incident_recovery_agent or IncidentRecoveryAgent()
 
     def check_drift(
         self,
@@ -1036,6 +1039,34 @@ class WorkflowOrchestrator:
             profiles[metric.name] = profile_dataset(output_df)
 
         return self._visualization_planner.plan(contract=contract, profiles=profiles)
+
+    def diagnose_incident(
+        self,
+        run_id: str,
+        *,
+        prior_failure_count: int = 0,
+        rollback_policy: str | None = None,
+    ) -> IncidentRecoveryResult:
+        """Runtime Incident and Recovery Agent (Section 26). Pure and
+        read-only: reads this run's own durably-recorded `RunRecord`/
+        `StepRunRecord`s (never guesses at logs this codebase does not
+        keep) and proposes the one safe action for whatever it finds - a
+        step stalled at RUNNING (a crash - safe to RETRY, since `run()`
+        is crash-safe by construction), a FAILED step with a real
+        `ErrorCode` (never RETRY; QUARANTINE/STOP/ESCALATE depending on
+        the code - see the module's own docstring), or neither (nothing
+        to recover). `prior_failure_count`/`rollback_policy` are always
+        caller-supplied, since this codebase's `RunStore` keeps only the
+        latest attempt per step and no automation's rollback policy is
+        looked up here on the caller's behalf.
+        """
+        run = self._run_store.get_run(run_id)
+        if run is None:
+            raise PlatformError(ErrorCode.SCHEMA_MISSING, f"no run with id '{run_id}'")
+        step_runs = self._run_store.list_step_runs(run_id)
+        return self._incident_recovery_agent.diagnose(
+            run=run, step_runs=step_runs, prior_failure_count=prior_failure_count, rollback_policy=rollback_policy
+        )
 
     def _fail_step_and_quarantine(
         self,
