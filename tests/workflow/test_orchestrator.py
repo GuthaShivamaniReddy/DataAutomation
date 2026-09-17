@@ -1101,6 +1101,46 @@ def test_select_operations_reports_no_safe_operation_for_an_unmapped_type(tmp_pa
     assert result.unresolved[0].step_id == "s1"
 
 
+def test_propose_cleaning_rules_translates_a_governed_null_policy(tmp_path):
+    registry = OperationRegistry()
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    contract = RequirementContract(
+        objective="x", sources=[Source(name="orders")], null_policy={"net_amount": "error"}
+    )
+
+    result = orchestrator.propose_cleaning_rules(contract)
+
+    assert result.blocking_items == []
+    assert result.rules[0].rule_id == "null_policy:net_amount"
+    assert result.rules[0].approval_required is False
+
+
+def test_propose_cleaning_rules_blocks_an_ungoverned_completeness_gap(tmp_path):
+    orders = pl.DataFrame({"order_id": [1, 2, 3, 4, 5], "customer_age": [30, None, 40, None, 50]})
+
+    registry = OperationRegistry()
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store)
+
+    contract = RequirementContract(
+        objective="x",
+        sources=[Source(name="orders")],
+        metrics=[Metric(name="avg_age", source_fields=["orders.customer_age"], definition_status=DefinitionStatus.GOVERNED)],
+    )
+    profiles = {"orders": profile_dataset(orders)}
+    schema_mapping = orchestrator.map_schema(contract, profiles)
+    quality_report = orchestrator.assess_data_quality(contract, profiles, schema_mapping=schema_mapping)
+
+    result = orchestrator.propose_cleaning_rules(contract, quality_report=quality_report)
+
+    assert result.rules == []
+    assert any(b.field == "orders.customer_age" for b in result.blocking_items)
+
+
 def test_map_schema_flags_an_unresolvable_source_field(tmp_path):
     orders = pl.DataFrame({"order_id": [1, 2]})
 

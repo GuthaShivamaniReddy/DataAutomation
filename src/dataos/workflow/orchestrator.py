@@ -21,6 +21,7 @@ import polars as pl
 from pydantic import BaseModel
 
 from dataos.compiler.automation_builder import AutomationSpec, AutomationWorkflowBuilder
+from dataos.compiler.cleaning_strategy_agent import CleaningPlan, CleaningStrategyAgent
 from dataos.compiler.confidence_scorer import ConfidenceReport, ConfidenceScorer
 from dataos.compiler.connector_planner import ConnectorWritePlanner, ExternalActionPlan, ExternalActionVerification
 from dataos.compiler.data_quality_assessor import DataQualityAssessor, DataQualityReport
@@ -118,6 +119,7 @@ class WorkflowOrchestrator:
         schema_mapping_agent: SchemaMappingAgent | None = None,
         data_quality_assessor: DataQualityAssessor | None = None,
         operation_registry_selector: OperationRegistrySelector | None = None,
+        cleaning_strategy_agent: CleaningStrategyAgent | None = None,
     ) -> None:
         self._registry = registry
         self._run_store = run_store
@@ -140,6 +142,7 @@ class WorkflowOrchestrator:
         self._schema_mapping_agent = schema_mapping_agent or SchemaMappingAgent()
         self._data_quality_assessor = data_quality_assessor or DataQualityAssessor()
         self._operation_registry_selector = operation_registry_selector or OperationRegistrySelector(self._registry)
+        self._cleaning_strategy_agent = cleaning_strategy_agent or CleaningStrategyAgent()
 
     def check_drift(
         self,
@@ -320,6 +323,25 @@ class WorkflowOrchestrator:
         before a plan is built at all.
         """
         return self._operation_registry_selector.select(steps)
+
+    def propose_cleaning_rules(
+        self,
+        contract: RequirementContract,
+        *,
+        quality_report: DataQualityReport | None = None,
+    ) -> CleaningPlan:
+        """Cleaning Strategy Agent (Section 11). Pure and read-only, like
+        `map_schema`/`assess_data_quality`: proposes, but never applies, a
+        cleaning rule for every column with a governed
+        `contract.null_policy` entry, plus a rule or blocking item for
+        every REQUIRES_RULE/BLOCKING issue in an `assess_data_quality()`
+        report (pass that report's result straight through as
+        `quality_report` to chain the two). Nothing returned here ever
+        mutates data on its own - a rule only takes effect once a human
+        approves it and it is expressed as an actual workflow step
+        (e.g. the registered `deduplicate` operation).
+        """
+        return self._cleaning_strategy_agent.propose(contract=contract, quality_report=quality_report)
 
     def verify_external_actions(self, run_id: str, workflow: Workflow) -> list[ExternalActionVerification]:
         """Independent post-write verification for every planned external
