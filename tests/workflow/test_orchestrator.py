@@ -606,6 +606,51 @@ def test_explain_after_release_produces_a_grounded_finding(fixtures_dir, tmp_pat
     assert output.envelope.status == "OK"
 
 
+def test_plan_visualizations_after_release_produces_a_stat_visual(fixtures_dir, tmp_path):
+    orchestrator, planned, contract = _released_run(fixtures_dir, tmp_path)
+
+    result = orchestrator.plan_visualizations(planned.run_id, planned.planner_output.workflow, contract)
+
+    assert result.visuals
+    visual = result.visuals[0]
+    assert visual.title == "order_count"
+    assert visual.chart_type == "stat"
+
+
+def test_plan_visualizations_refuses_a_run_that_is_not_released(fixtures_dir, tmp_path):
+    df = pl.read_csv(fixtures_dir / "orders_basic.csv")
+    version = ingest_file(fixtures_dir / "orders_basic.csv", storage_root=tmp_path / "dataos_store")
+
+    registry = OperationRegistry()
+    registry.register(AggregateOperation())
+
+    run_store = RunStore(tmp_path / "runs.db")
+    artifact_store = ArtifactStore(tmp_path / "artifacts")
+    planner = WorkflowPlanner(DeterministicLLMClient(), registry)
+    orchestrator = WorkflowOrchestrator(registry, run_store, artifact_store, planner)
+
+    contract = RequirementContract(
+        objective="show order count",
+        sources=[Source(name="orders")],
+        metrics=[
+            Metric(name="order_count", formula="count(orders.order_id)", definition_status=DefinitionStatus.GOVERNED)
+        ],
+        status=RequirementStatus.APPROVED,
+    )
+
+    planned = orchestrator.start_run_from_contract(
+        contract=contract,
+        contract_id="rc_viz_test",
+        source_frames={"orders": df},
+        source_versions={"orders": version},
+    )
+
+    with pytest.raises(PlatformError) as excinfo:
+        orchestrator.plan_visualizations(planned.run_id, planned.planner_output.workflow, contract)
+
+    assert excinfo.value.code == ErrorCode.VALIDATION_FAIL
+
+
 def test_explain_refuses_a_run_that_is_not_released(fixtures_dir, tmp_path):
     df = pl.read_csv(fixtures_dir / "orders_basic.csv")
     version = ingest_file(fixtures_dir / "orders_basic.csv", storage_root=tmp_path / "dataos_store")

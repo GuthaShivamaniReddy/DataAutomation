@@ -39,6 +39,7 @@ from dataos.compiler.schema_drift_monitor import DriftReport, SchemaDriftMonitor
 from dataos.compiler.schema_mapping_agent import SchemaMappingAgent, SchemaMappingResult
 from dataos.compiler.security_guard import SecurityGuard
 from dataos.compiler.validation_rule_generator import CheckSpec, ValidationRuleGenerator
+from dataos.compiler.visualization_planner import VisualizationPlanner, VisualizationPlanResult
 from dataos.compiler.workflow_planner import PlannerOutput, WorkflowPlanner
 from dataos.contracts.requirement_contract import RequirementContract
 from dataos.errors import ErrorCode, PlatformError
@@ -124,6 +125,7 @@ class WorkflowOrchestrator:
         cleaning_strategy_agent: CleaningStrategyAgent | None = None,
         analytics_strategy_agent: AnalyticsStrategyAgent | None = None,
         ml_suitability_gate: MLSuitabilityGate | None = None,
+        visualization_planner: VisualizationPlanner | None = None,
     ) -> None:
         self._registry = registry
         self._run_store = run_store
@@ -149,6 +151,7 @@ class WorkflowOrchestrator:
         self._cleaning_strategy_agent = cleaning_strategy_agent or CleaningStrategyAgent()
         self._analytics_strategy_agent = analytics_strategy_agent or AnalyticsStrategyAgent()
         self._ml_suitability_gate = ml_suitability_gate or MLSuitabilityGate()
+        self._visualization_planner = visualization_planner or VisualizationPlanner()
 
     def check_drift(
         self,
@@ -999,6 +1002,40 @@ class WorkflowOrchestrator:
             forced_limitations=forced_limitations,
             audience=audience,
         )
+
+    def plan_visualizations(self, run_id: str, workflow: Workflow, contract: RequirementContract) -> VisualizationPlanResult:
+        """Visualization Planner (Section 17). Only ever callable on a
+        RELEASED run, same restriction as `explain()` and for the same
+        reason: "design visualizations that faithfully represent
+        verified data." Profiles each covered metric's real output
+        artifact (never a raw source, never a value this method computes
+        itself) and hands those profiles to the deterministic planner -
+        see that module's docstring for how chart type/warnings are
+        decided from profile evidence alone.
+        """
+        run = self._run_store.get_run(run_id)
+        if run is None:
+            raise PlatformError(ErrorCode.SCHEMA_MISSING, f"no run with id '{run_id}'")
+        if run.state != RunState.RELEASED:
+            raise PlatformError(
+                ErrorCode.VALIDATION_FAIL,
+                "cannot plan visualizations for a run that is not RELEASED",
+                evidence={"run_id": run_id, "state": run.state.value},
+            )
+
+        step_runs = {s.step_id: s for s in self._run_store.list_step_runs(run_id)}
+        profiles: dict[str, DatasetProfile] = {}
+        for metric in contract.metrics:
+            covering_steps = [s for s in workflow.steps if metric.name in s.requirement_refs]
+            if not covering_steps:
+                continue
+            record = step_runs.get(covering_steps[0].id)
+            if record is None or record.status != "COMPLETED":
+                continue
+            output_df = self._artifact_store.load_by_ids(run_id, covering_steps[0].id)
+            profiles[metric.name] = profile_dataset(output_df)
+
+        return self._visualization_planner.plan(contract=contract, profiles=profiles)
 
     def _fail_step_and_quarantine(
         self,
