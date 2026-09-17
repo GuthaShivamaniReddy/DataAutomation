@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>DataOS Analyst Workbench</title>
+<link rel="stylesheet" href="styles.css" />
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+</head>
+<body>
+<header>
+  <h1>DataOS Analyst Workbench</h1>
+  <span id="backend-badge" class="badge">checking backend…</span>
+</header>
+
+<main>
+  <section id="section-datasets" class="card">
+    <h2>1. Datasets</h2>
+    <form id="upload-form">
+      <input type="file" id="file-input" accept=".csv,.xlsx,.xls,.parquet" required />
+      <input type="text" id="dataset-name" placeholder="Dataset name (optional)" />
+      <button type="submit">Upload</button>
+    </form>
+    <div id="upload-feedback"></div>
+    <table id="dataset-table">
+      <thead><tr><th>Select</th><th>Name</th><th>Rows</th><th>Columns</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section id="section-requirement" class="card">
+    <h2>2. Describe the requirement</h2>
+    <textarea id="objective-input" rows="3" placeholder="e.g. show revenue by region for last quarter"></textarea>
+    <button id="create-requirement-btn">Submit</button>
+
+    <div id="contract-panel" class="hidden">
+      <h3>Requirement Contract</h3>
+      <div id="contract-summary"></div>
+      <div id="clarifications-panel" class="hidden">
+        <h4>Clarifications needed</h4>
+        <ul id="clarifications-list"></ul>
+        <textarea id="clarification-answer" rows="2" placeholder="Answer the clarification(s) above…"></textarea>
+        <button id="revise-btn">Resubmit</button>
+      </div>
+      <button id="approve-btn" class="hidden">Approve</button>
+    </div>
+  </section>
+
+  <section id="section-plan" class="card hidden">
+    <h2>3. Plan review</h2>
+    <button id="plan-btn">Plan</button>
+    <div id="plan-panel"></div>
+    <button id="start-btn" class="hidden">Run workflow</button>
+  </section>
+
+  <section id="section-run" class="card hidden">
+    <h2>4. Run</h2>
+    <div id="run-status"></div>
+    <button id="release-btn" class="hidden">Release</button>
+  </section>
+
+  <section id="section-result" class="card hidden">
+    <h2>5. Result</h2>
+    <div id="explanation-panel"></div>
+    <div id="charts-panel"></div>
+    <div id="table-panel">
+      <table id="result-table"><thead></thead><tbody></tbody></table>
+      <div id="result-pager"></div>
+    </div>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
